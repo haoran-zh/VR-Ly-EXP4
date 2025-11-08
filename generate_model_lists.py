@@ -1,31 +1,5 @@
 import pickle
 import numpy as np
-from utils import convert_arrays_to_shapes
-
-# choose to_handle_datasets from below
-# ['arc', 'hellaswag', 'mmlu', 'winogrande', 'gsm8k']
-# ['ifeval', 'bbh', 'gpqa', 'musr', 'math', 'mmlu_pro']
-to_handle_dataset = 'gsm8k'
-
-# load the pre-built router dataset
-# with open(f'data/router_dataset/{to_handle_dataset}_router_dataset.pkl', 'rb') as f:
-#     router_dataset = pickle.load(f)
-#
-# # display the pre-built router dataset
-# # print(convert_arrays_to_shapes(router_dataset))
-#
-#
-#
-# print(f"Keys: {router_dataset.keys()}")
-
-# print(f"data: {router_dataset['easy'][5]['strong_to_weak']['data']}")
-# print(f"model: {router_dataset['easy'][5]['strong_to_weak']['model']}")
-
-# print(f"model: {router_dataset['hard'][1000]['strong_to_weak']['model']}")
-# print(f"model: {router_dataset['split_index']}")  # how they split the dataset into train, val, test
-# print(f"model: {router_dataset['embedding']['train_embed']}")
-# print(f"model: {router_dataset['prompt']['train_prompt']}")
-
 from huggingface_hub import list_repo_files
 
 # full data folders
