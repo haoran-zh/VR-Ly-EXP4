@@ -46,15 +46,13 @@ def unzip_file(zip_path, extract_to_dir):
 
 # for 'ifeval', 'bbh', 'gpqa', 'musr', 'math_lv_5', 'mmlu_pro'
 
-data_options = ['ifeval', 'bbh', 'gpqa', 'musr', 'math_lv_5', 'mmlu_pro']
+data_options = ['bbh', 'gpqa', 'musr', 'math_lv_5', 'mmlu_pro']
 model_keywords = ['openai-community__gpt2-details',
                 'openai-community__gpt2-large-details',
                 'openai-community__gpt2-xl-details',
                     'deepseek-ai__deepseek-llm-7b',
                   'deepseek-ai__deepseek-moe-16b',
                   'deepseek-ai__deepseek-llm-67b',
-                  'mistral-community__Mistral-7B-v0.2-details',
-                  'mistral-community__Mixtral-8x22B-v0.1-details',
                   'Qwen__Qwen2.5-0.5B-Instruct-details',
                   'Qwen__Qwen1.5-0.5B-Chat',
                   'Qwen__Qwen2.5-32B',
@@ -85,13 +83,75 @@ model_keywords = ['openai-community__gpt2-details',
 #         extraction_dir = os.path.dirname(local_path)
 #         unzip_file(local_path, extraction_dir)
 # ------------------------------------------------
-# reorganize data
+
+
+# ----------------reorganize data----------------
 # /home/hz8556/llmooo/data/ooo_dataset/full_data/bbh/Qwen__Qwen2.5-32B-Instruct-details_1488.pkl
 # /home/hz8556/llmooo/data/ooo_dataset/full_data/bbh/openai-community__gpt2-xl-details_754.pkl
 # /home/hz8556/llmooo/data/ooo_dataset/full_data/bbh/deepseek-ai__deepseek-llm-7b-base-details_2827.pkl
-# /home/hz8556/llmooo/data/ooo_dataset/full_data/bbh/mistral-community__Mixtral-8x22B-v0.1-details_3466.pkl (evaluate not all)
-with open(f'./data/ooo_dataset/full_data/math_lv_5/Qwen__Qwen2.5-32B-Instruct-details_1488.pkl', 'rb') as f:
-    deepseek_ai = pickle.load(f)
-print(deepseek_ai['math_algebra_hard']['exact_match'])
+# for 'ifeval', 'bbh', 'gpqa', 'musr', 'math_lv_5', 'mmlu_pro'
+# with open(f'./data/ooo_dataset/full_data/mmlu_pro/Qwen__Qwen2.5-32B-details_2769.pkl', 'rb') as f:
+#     deepseek_ai = pickle.load(f)
+# keys = list(deepseek_ai.keys()) # convert to list
+# print(deepseek_ai.keys())
+# print(deepseek_ai[keys[0]].keys())
+# subkeys = list(deepseek_ai[keys[0]].keys())
+# print(deepseek_ai[keys[0]][subkeys[-1]])
+# dict_keys(['doc_id', 'doc', 'target', 'arguments', 'resps', 'filtered_resps', 'doc_hash', 'prompt_hash', 'target_hash', 'acc_norm'])
+# use last key as acc
+#
+
+def get_model_result(model_file, dataset_folder, subdataset, idx):
+    with open(os.path.join(dataset_folder, model_file), 'rb') as f:
+         model_result = pickle.load(f)
+    acc_key = list(model_result[subdataset])[-1]
+    # model_result[subdataset][acc_key][idx] can be 0 or 1, or True or False. If get True or False, convert to 1 and 0.
+    try:
+        model_result[subdataset][acc_key] = np.array(model_result[subdataset][acc_key])
+    except:
+        print(model_result[subdataset][acc_key])
+    model_result[subdataset][acc_key][model_result[subdataset][acc_key] == True] = 1
+    model_result[subdataset][acc_key][model_result[subdataset][acc_key] == False] = 0
+    # if contains none, also set to 0
+    model_result[subdataset][acc_key][model_result[subdataset][acc_key] == 'none'] = 0
+    return model_result[subdataset][acc_key][idx]
+
+
+ooo_dataset = {}
+ooo_dataset['available_models'] = model_keywords
+ooo_dataset['available_datasets'] = data_options
+ooo_dataset['full_data'] = []
+task_types = []
+for dataset_idx in data_options:
+    data_folder = f'./data/ooo_dataset/full_data/{dataset_idx}/'
+    models_list = os.listdir(data_folder)
+    first_model = os.path.join(data_folder, models_list[0])
+    with open(first_model, 'rb') as f:
+         first_model_result = pickle.load(f)
+    subdataset_keys = list(first_model_result.keys())
+    # add task types
+    task_types.extend(subdataset_keys)
+    for subdata_idx in subdataset_keys:
+        num_samples = len(first_model_result[subdata_idx]['doc_id'])
+        print(f'subdataset {subdata_idx} contain {num_samples} samples')
+        for sample_idx in range(num_samples):
+            query = {}
+            query['category'] = dataset_idx + '-' + subdata_idx
+            query['idx'] = sample_idx
+            model_results = []
+            for model_idx in model_keywords:
+                # search the model_filename from model_list (if model_keywords contains in the list)
+                model_file = next(
+                    filename for filename in models_list if model_idx in filename)
+                model_results.append(get_model_result(model_file, data_folder, subdataset=subdata_idx, idx=sample_idx))
+            query['results'] = model_results
+            ooo_dataset['full_data'].append(query)
+
+
+ooo_dataset['task_types'] = task_types
+ooo_dataset['total_samples'] = len(ooo_dataset['full_data'])
+# pkl save ooo_dataset
+with open(f'data/ooo_dataset/ooo_dataset1.pkl', 'wb') as f:
+    pickle.dump(ooo_dataset, f)
 
 
