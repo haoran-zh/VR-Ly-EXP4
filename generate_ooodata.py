@@ -212,8 +212,25 @@ def organize_data():
             # This loop now only does dictionary and array lookups (RAM access)
             for sample_idx in range(num_samples):
                 query = {}
-                query['category'] = dataset_idx + '-' + subdata_idx
+                query['category'] = subdata_idx
                 query['idx'] = sample_idx
+                if cnt > 4:
+                    if dataset_idx == 'ifeval':
+                        query['length'] = len(first_model_result[subdata_idx]['doc'][sample_idx]['prompt'])
+                    elif dataset_idx == 'bbh':
+                        query['length'] = len(first_model_result[subdata_idx]['doc'][sample_idx]['input'])
+                    elif dataset_idx == 'gpqa':
+                        query['length'] = len(first_model_result[subdata_idx]['doc'][sample_idx]['Pre-Revision Question'])
+                    elif dataset_idx == 'musr':
+                        query['length'] = len(first_model_result[subdata_idx]['doc'][sample_idx]['narrative']) + len(first_model_result[subdata_idx]['doc'][sample_idx]['question'])
+                    elif dataset_idx == 'math_lv_5':
+                        query['length'] = len(
+                            first_model_result[subdata_idx]['doc'][sample_idx]['problem'])
+                    elif dataset_idx == 'mmlu_pro':
+                        query['length'] = len(first_model_result[subdata_idx]['doc'][sample_idx]['question'])
+                else:
+                    query['length'] = len(first_model_result[subdata_idx]['full_prompt'][sample_idx])
+
 
                 model_results = []
                 for model_idx in model_keywords:
@@ -243,16 +260,20 @@ def organize_data():
     print("✅ All done.")
 
 # download_data()
-# organize_data()
+organize_data()
 # read ooo_dataset
 # /home/hz8556/llmooo/data/ooo_dataset/full_data/arc_challenge/details_deepseek-ai__deepseek-moe-16b-base.pkl
 # /home/hz8556/llmooo/data/ooo_dataset/full_data/ifeval/deepseek-ai__deepseek-llm-67b-chat-details_1361.pkl
-with open(f'data/ooo_dataset/ooo_dataset1.pkl', 'rb') as f:
-    ooo_dataset = pickle.load(f)
-# dict_keys(['choices', 'cont_tokens', 'example', 'full_prompt', 'gold',
-# 'gold_index', 'input_tokens', 'instruction', 'metrics', 'num_asked_few_shots',
-# 'num_effective_few_shots', 'padded', 'pred_logits', 'predictions', 'truncated'])
-# print(ooo_dataset['harness|truthfulqa:mc|0']['predictions'])
-print(len(ooo_dataset['task_types']))
-print(ooo_dataset['total_samples'])
-print(ooo_dataset['full_data'][28769])
+# 'musr', 'math_lv_5', 'mmlu_pro'
+# with open(f'data/ooo_dataset/ooo_dataset1.pkl', 'rb') as f:
+# with open(f'data/ooo_dataset/full_data/mmlu_pro/deepseek-ai__deepseek-llm-67b-chat-details_1361.pkl', 'rb') as f:
+#     ooo_dataset = pickle.load(f)
+# # # # dict_keys(['choices', 'cont_tokens', 'example', 'full_prompt', 'gold',
+# # # # 'gold_index', 'input_tokens', 'instruction', 'metrics', 'num_asked_few_shots',
+# # # # 'num_effective_few_shots', 'padded', 'pred_logits', 'predictions', 'truncated'])
+# # # # print(ooo_dataset['harness|arc:challenge|25']['full_prompt'])
+# # # # print(ooo_dataset['harness|arc:challenge|25']['full_prompt'])
+# print(ooo_dataset['mmlu_pro']['doc'][3].keys())
+# print(len(ooo_dataset['task_types']))
+# print(ooo_dataset['total_samples'])
+# print(ooo_dataset['full_data'][28769])

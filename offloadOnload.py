@@ -1,24 +1,52 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from utilities.model_performance import estimate_model_perforance, convert_offloadingCost, estimate_offloadingCost, lowest_avg_error
+import pickle as pkl
+import random
 
+# read dataset
+FILENAME = './data/ooo_dataset/ooo_dataset1.pkl'
+with open(FILENAME, 'rb') as f:
+    data = pkl.load(f)
 # --- System & Task Configuration ---
 # Define error rates for [client, edge, cloud]
-ERROR_RATES = {
-    #  client   edge    cloud
-    0: [0.5, 0.3, 0.0],  # Task type 1
-    1: [0.6, 0.4, 0.0],  # Task type 2
-    2: [0.7, 0.5, 0.0],  # Task type 3
-}
+Avg_acc, Avg_err = estimate_model_perforance(data)
+ERROR_RATES = Avg_err
+# ERROR_RATES = {
+#     #  client   edge    cloud
+#     0: [0.5, 0.3, 0.0],  # Task type 1
+#     1: [0.6, 0.4, 0.0],  # Task type 2
+#     2: [0.7, 0.5, 0.0],  # Task type 3
+# }
 
 # Define BASE offloading costs (actual costs will have randomness added)
-BASE_OFFLOADING_COSTS = {
-    # client_to_edge, edge_to_cloud
-    0: [1.0, 0.5],  # Task type 1
-    1: [2.0, 1.0],  # Task type 2
-    2: [3.0, 1.5],  # Task type 3
-}
+OffloadCost_SCALE = 0.001
+avg_offloadCost = estimate_offloadingCost(data, OffloadCost_SCALE)
+# BASE_OFFLOADING_COSTS = {
+#     # client_to_edge, edge_to_cloud
+#     0: [1.0, 0.5],  # Task type 1
+#     1: [2.0, 1.0],  # Task type 2
+#     2: [3.0, 1.5],  # Task type 3
+# }
 
-NUM_TASK_TYPES = len(ERROR_RATES)
+NUM_TASK_TYPES = len(data['task_types'])
+TASK_NAMES = data['task_types']
+TOTAL_JOBS = data['total_samples']
+
+model_keywords = [
+    'openai-community__gpt2-large', # 0
+    'gpt2-xl',                      # 1
+    'deepseek-llm-7b',              # 2
+    'deepseek-ai__deepseek-moe-16b',# 3
+    'deepseek-ai__deepseek-llm-67b',# 4
+    'Qwen__Qwen2-0.5B',             # 5
+    'Qwen__Qwen1.5-0.5B',           # 6
+    'Qwen__Qwen2-72B',              # 7
+]
+
+available_client_models = [2, 3, 5, 6]
+available_edge_models = [0, 1, 4, 7]
+
 
 
 def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
@@ -60,20 +88,13 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
     Q_c = 0.0  # Client-to-edge queue
     Q_e = 0.0  # Edge-to-cloud queue
 
-    task_counts = np.zeros(NUM_TASK_TYPES)
+    task_counts = {t: 0 for t in TASK_NAMES}
 
     # For variance reduction: track estimated costs and error rates
     if use_variance_reduction:
         # Initialize with true values (as specified in requirements)
-        estimated_error_rates = {t: list(ERROR_RATES[t]) for t in range(NUM_TASK_TYPES)}
-
-        # Initialize estimated costs as running averages
-        estimated_costs_c = {t: BASE_OFFLOADING_COSTS[t][0] for t in range(NUM_TASK_TYPES)}
-        estimated_costs_e = {t: BASE_OFFLOADING_COSTS[t][1] for t in range(NUM_TASK_TYPES)}
-
         # Counters for running averages
-        cost_observation_counts_c = {t: 1 for t in range(NUM_TASK_TYPES)}
-        cost_observation_counts_e = {t: 1 for t in range(NUM_TASK_TYPES)}
+        cost_observation_counts_c = {t: 2000 for t in TASK_NAMES}
 
     history = {
         'errors': [], 'costs_client': [], 'costs_edge': [], 'costs_total': [],
@@ -85,34 +106,30 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
 
     # --- Main Simulation Loop ---
     for j in range(num_jobs):
-        # Sample task type and generate confidence
-        task_type = np.random.randint(0, NUM_TASK_TYPES)
-        client_err = ERROR_RATES[task_type][0]
-        edge_err = ERROR_RATES[task_type][1]
-        cloud_err = ERROR_RATES[task_type][2]
+        # Select one value, range from 0 to TOTAL_JOBS
+        idx = random.randint(0, num_jobs - 1)
+        task_type = data['full_data'][idx]['category']
+        task_type_idx = TASK_NAMES.index(task_type)
+        # here we ignore onloading, need to add the onloading problem in the future
+        client_err, best_client_model = lowest_avg_error(ERROR_RATES[task_type], available_client_models)
+        edge_err, best_edge_model = lowest_avg_error(ERROR_RATES[task_type], available_edge_models)
+        # cloud_err = ERROR_RATES[task_type][2]
         mean_confidence = 1.0 - client_err
         std_dev = 0.1
         confidence_Z = np.random.normal(loc=mean_confidence, scale=std_dev)
         confidence_Z = np.clip(confidence_Z, 0, 1)
 
         # Get costs for this task type (with added randomness)
-        base_C_c = BASE_OFFLOADING_COSTS[task_type][0]  # Client to edge
-        base_C_e = BASE_OFFLOADING_COSTS[task_type][1]  # Edge to cloud
 
         # Add Gaussian noise to costs
-        C_c = base_C_c + np.random.normal(0, cost_std)
-        C_e = base_C_e + np.random.normal(0, cost_std)
-
-        # Ensure costs are non-negative
-        C_c = max(0, C_c)
-        C_e = max(0, C_e)
+        C_c = convert_offloadingCost(data, sample_idx=idx, scale=OffloadCost_SCALE)
 
         task_counts[task_type] += 1
 
         # --- CLIENT DECISION ---
         # Determine which experts recommend offloading
         client_offload_experts = expert_thresholds > confidence_Z
-        prob_offload_c = np.sum(w_client[task_type, client_offload_experts])
+        prob_offload_c = np.sum(w_client[task_type_idx, client_offload_experts])
         prob_offload_c = np.clip(prob_offload_c, 1e-5, 1 - 1e-5)
 
         # Sample client decision
@@ -127,7 +144,7 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
             edge_confidence_Z = np.random.normal(loc=mean_confidence, scale=std_dev)
             edge_confidence_Z = np.clip(edge_confidence_Z, 0, 1)
             edge_offload_experts = expert_thresholds > edge_confidence_Z
-            prob_offload_e = np.sum(w_edge[task_type, edge_offload_experts])
+            prob_offload_e = np.sum(w_edge[task_type_idx, edge_offload_experts])
             prob_offload_e = np.clip(prob_offload_e, 1e-5, 1 - 1e-5)
 
             # Sample edge decision
@@ -138,21 +155,21 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
         # --- DETERMINE JOB ERROR ---
         if o_c == 0:
             # Processed at client
-            job_error = 1 if np.random.rand() < ERROR_RATES[task_type][0] else 0
+            job_error = int(1 - data['full_data'][idx]['results'][best_client_model])
         elif o_e == 0:
             # Processed at edge
-            job_error = 1 if np.random.rand() < ERROR_RATES[task_type][1] else 0
+            job_error = int(1 - data['full_data'][idx]['results'][best_edge_model])
         else:
             # Processed at cloud
-            job_error = 1 if np.random.rand() < ERROR_RATES[task_type][2] else 0
+            job_error = 0
 
         # --- FEEDBACK AND LOSS COMPUTATION ---
         # Feedback is only available if BOTH client and edge offload (o_c=1 AND o_e=1)
         feedback_received = (o_c == 1) and (o_e == 1)
 
-        # Actual error rates (revealed only with full feedback)
-        b_c = ERROR_RATES[task_type][0]  # Client error rate
-        b_e = ERROR_RATES[task_type][1]  # Edge error rate
+        # Actual error indicator
+        b_c = int(1 - data['full_data'][idx]['results'][best_client_model])
+        b_e = int(1 - data['full_data'][idx]['results'][best_edge_model])
 
         # --- UPDATE CLIENT WEIGHTS ---
         L_hat_c = np.zeros(num_experts)
@@ -161,13 +178,12 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
         if feedback_received and use_variance_reduction:
             # Update client cost estimate
             count_c = cost_observation_counts_c[task_type]
-            estimated_costs_c[task_type] = (estimated_costs_c[task_type] * count_c + C_c) / (count_c + 1)
+            avg_offloadCost[task_type] = (avg_offloadCost[task_type] * count_c + C_c) / (count_c + 1)
             cost_observation_counts_c[task_type] += 1
 
             # Update edge cost estimate
-            count_e = cost_observation_counts_e[task_type]
-            estimated_costs_e[task_type] = (estimated_costs_e[task_type] * count_e + C_e) / (count_e + 1)
-            cost_observation_counts_e[task_type] += 1
+            avg_offloadCost[task_type] = (avg_offloadCost[task_type] * count_c + C_c) / (count_c + 1)
+            cost_observation_counts_c[task_type] += 1
 
         # Compute loss estimator for each expert
         if use_variance_reduction:
@@ -175,10 +191,10 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
             for a in range(num_experts):
                 o_hat_c_a = 1 if expert_thresholds[a] > confidence_Z else 0
 
-                b_hat_c = estimated_error_rates[task_type][0]
-                b_hat_e = estimated_error_rates[task_type][1]
-                C_hat_c = estimated_costs_c[task_type]
-                C_hat_e = estimated_costs_e[task_type]
+                b_hat_c = client_err
+                b_hat_e = edge_err
+                C_hat_c = avg_offloadCost[task_type]
+                C_hat_e = avg_offloadCost[task_type]
 
                 # Compute expected offloading loss
                 L_hat_offload = Q_c * C_hat_c + v_param * (
@@ -197,7 +213,7 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
                     # Expert recommends offloading to edge
                     if feedback_received:
                         # Have observations: use residual + baseline
-                        L_offload_actual = Q_c * C_c + v_param * (1 - prob_offload_e) * b_e + prob_offload_e * Q_e * C_e
+                        L_offload_actual = Q_c * C_c + v_param * (1 - prob_offload_e) * b_e + prob_offload_e * Q_e * C_c
                         residual_offload = (L_offload_actual - L_hat_offload) / (prob_offload_c * prob_offload_e)
                         L_hat_c[a] = residual_offload + L_hat_offload
                     else:
@@ -205,7 +221,7 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
                         L_hat_c[a] = L_hat_offload
 
             # Always update with VR
-            S_client[task_type] += L_hat_c
+            S_client[task_type_idx] += L_hat_c
 
         elif feedback_received:
             # ORIGINAL: Only update when we have feedback
@@ -215,13 +231,13 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
                 if o_hat_c_a == 0:
                     L_ideal_c = v_param * b_c
                 else:
-                    L_offload = Q_c * C_c + (1 - prob_offload_e) * v_param * b_e + prob_offload_e * Q_e * C_e
+                    L_offload = Q_c * C_c + (1 - prob_offload_e) * v_param * b_e + prob_offload_e * Q_e * C_c
                     L_ideal_c = L_offload
 
                 L_hat_c[a] = L_ideal_c / (prob_offload_c * prob_offload_e)
 
             # Only update when we have feedback
-            S_client[task_type] += L_hat_c
+            S_client[task_type_idx] += L_hat_c
 
         # --- UPDATE EDGE WEIGHTS (only if client offloaded) ---
         L_hat_e = np.zeros(num_experts)
@@ -233,8 +249,8 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
                 for k in range(num_experts):
                     o_hat_e_k = 1 if expert_thresholds[k] > edge_confidence_Z else 0
 
-                    b_hat_e = estimated_error_rates[task_type][1]
-                    C_hat_e = estimated_costs_e[task_type]
+                    b_hat_e = edge_err
+                    C_hat_e = avg_offloadCost[task_type]
 
                     if o_hat_e_k == 0:
                         # Expert recommends processing at edge
@@ -249,14 +265,14 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
                         # Expert recommends offloading to cloud
                         if feedback_received:
                             # Have observations: use residual + baseline
-                            residual_cost = (C_e - C_hat_e) / prob_offload_e
+                            residual_cost = (C_c - C_hat_e) / prob_offload_e
                             L_hat_e[k] = Q_e * (residual_cost + C_hat_e)
                         else:
                             # No observations: use baseline only
                             L_hat_e[k] = Q_e * C_hat_e
 
                 # Always update with VR when edge participates
-                S_edge[task_type] += L_hat_e
+                S_edge[task_type_idx] += L_hat_e
 
             elif feedback_received:
                 # ORIGINAL: Only update when we have feedback
@@ -266,42 +282,42 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
                     if o_hat_e_k == 0:
                         L_ideal_e = v_param * b_e
                     else:
-                        L_ideal_e = Q_e * C_e
+                        L_ideal_e = Q_e * C_c
 
                     L_hat_e[k] = L_ideal_e / prob_offload_e
 
                 # Only update when we have feedback
-                S_edge[task_type] += L_hat_e
+                S_edge[task_type_idx] += L_hat_e
 
         # --- UPDATE WEIGHTS USING EXP4 ---
         # Update client weights using log-sum-exp trick for numerical stability
-        S_client_task = S_client[task_type]
+        S_client_task = S_client[task_type_idx]
         log_w_client = -learning_rate * S_client_task
         log_w_client_max = np.max(log_w_client)
         log_w_client_shifted = log_w_client - log_w_client_max
-        w_client[task_type] = np.exp(log_w_client_shifted)
-        w_client[task_type] /= np.sum(w_client[task_type])
+        w_client[task_type_idx] = np.exp(log_w_client_shifted)
+        w_client[task_type_idx] /= np.sum(w_client[task_type_idx])
 
         # Ensure no NaN values
-        if np.any(np.isnan(w_client[task_type])):
-            w_client[task_type] = np.ones(num_experts) / num_experts
+        if np.any(np.isnan(w_client[task_type_idx])):
+            w_client[task_type_idx] = np.ones(num_experts) / num_experts
 
         # Update edge weights (if client offloaded)
         if o_c == 1:
-            S_edge_task = S_edge[task_type]
+            S_edge_task = S_edge[task_type_idx]
             log_w_edge = -learning_rate * S_edge_task
             log_w_edge_max = np.max(log_w_edge)
             log_w_edge_shifted = log_w_edge - log_w_edge_max
-            w_edge[task_type] = np.exp(log_w_edge_shifted)
-            w_edge[task_type] /= np.sum(w_edge[task_type])
+            w_edge[task_type_idx] = np.exp(log_w_edge_shifted)
+            w_edge[task_type_idx] /= np.sum(w_edge[task_type_idx])
 
             # Ensure no NaN values
-            if np.any(np.isnan(w_edge[task_type])):
-                w_edge[task_type] = np.ones(num_experts) / num_experts
+            if np.any(np.isnan(w_edge[task_type_idx])):
+                w_edge[task_type_idx] = np.ones(num_experts) / num_experts
 
         # --- UPDATE VIRTUAL QUEUES ---
         job_cost_c = o_c * C_c  # Client incurs cost only if it offloads
-        job_cost_e = o_c * o_e * C_e  # Edge incurs cost only if both offload
+        job_cost_e = o_c * o_e * C_c  # Edge incurs cost only if both offload
 
         Q_c = max(0, Q_c + job_cost_c - cost_budget_gamma_c)
         Q_e = max(0, Q_e + job_cost_e - cost_budget_gamma_e)
@@ -312,7 +328,7 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
         history['costs_edge'].append(job_cost_e)
         history['costs_total'].append(job_cost_c + job_cost_e)
         history['actual_costs_client'].append(C_c if o_c == 1 else 0)
-        history['actual_costs_edge'].append(C_e if o_c == 1 and o_e == 1 else 0)
+        history['actual_costs_edge'].append(C_c if o_c == 1 and o_e == 1 else 0)
         history['queue_client'].append(Q_c)
         history['queue_edge'].append(Q_e)
         history['offload_client'].append(o_c)
@@ -481,7 +497,7 @@ def plot_learning_comparison(agg_no_vr, agg_vr, num_jobs):
 if __name__ == '__main__':
     # --- Simulation Parameters ---
     NUM_TRIALS = 5
-    NUM_JOBS = 20000
+    NUM_JOBS = 40000
     NUM_EXPERTS = 50
     LEARNING_RATE_ETA = 0.01
     V_PARAM = 500
