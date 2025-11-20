@@ -260,20 +260,20 @@ def organize_data():
     print("✅ All done.")
 
 # download_data()
-organize_data()
+# organize_data()
 # read ooo_dataset
 # /home/hz8556/llmooo/data/ooo_dataset/full_data/arc_challenge/details_deepseek-ai__deepseek-moe-16b-base.pkl
 # /home/hz8556/llmooo/data/ooo_dataset/full_data/ifeval/deepseek-ai__deepseek-llm-67b-chat-details_1361.pkl
 # 'musr', 'math_lv_5', 'mmlu_pro'
-# with open(f'data/ooo_dataset/ooo_dataset1.pkl', 'rb') as f:
+with open(f'data/ooo_dataset/ooo_dataset1.pkl', 'rb') as f:
 # with open(f'data/ooo_dataset/full_data/mmlu_pro/deepseek-ai__deepseek-llm-67b-chat-details_1361.pkl', 'rb') as f:
-#     ooo_dataset = pickle.load(f)
+    ooo_dataset = pickle.load(f)
 # # # # dict_keys(['choices', 'cont_tokens', 'example', 'full_prompt', 'gold',
 # # # # 'gold_index', 'input_tokens', 'instruction', 'metrics', 'num_asked_few_shots',
 # # # # 'num_effective_few_shots', 'padded', 'pred_logits', 'predictions', 'truncated'])
 # # # # print(ooo_dataset['harness|arc:challenge|25']['full_prompt'])
 # # # # print(ooo_dataset['harness|arc:challenge|25']['full_prompt'])
 # print(ooo_dataset['mmlu_pro']['doc'][3].keys())
-# print(len(ooo_dataset['task_types']))
-# print(ooo_dataset['total_samples'])
-# print(ooo_dataset['full_data'][28769])
+print(len(ooo_dataset['task_types']))
+print(ooo_dataset['total_samples'])
+print(ooo_dataset['full_data'][28769])

@@ -44,16 +44,155 @@ model_keywords = [
     'Qwen__Qwen2-72B',              # 7
 ]
 
-available_client_models = [2, 3, 5, 6]
-available_edge_models = [0, 1, 4, 7]
+
+ENABLE_ONLOADING = True
+available_client_models = [0, 2, 3, 5, 6]
+available_edge_models = [1, 4, 7]
+MODEL_SIZES = np.array([0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0])  # Sizes for each model_keywords
+MODEL_ONLOADING_COSTS = MODEL_SIZES
+CLIENT_MEMORY_CAPACITY = 17  # Adjust based on your model sizes
+EDGE_MEMORY_CAPACITY = 85
+ONLOADING_EPOCH_LENGTH = 500
+V_ONLOAD = 700
 
 
+def initialize_onloaded_models(memory_capacity, model_ids, model_sizes):
+    """Randomly selects an initial set of models that fit within the memory capacity."""
+    S = set()
+    remaining_capacity = memory_capacity
+    available_models = list(model_ids)
+    np.random.shuffle(available_models)
+    for model_id in available_models:
+        if model_sizes[model_id] <= remaining_capacity:
+            S.add(model_id)
+            remaining_capacity -= model_sizes[model_id]
+    return list(S)
+
+
+def enhanced_greedy_onloading(V, prev_onloaded_models,
+                              memory_capacity, model_sizes, onloading_costs,
+                              error_rates_dict, task_dist_estimate,
+                              available_models, task_names):
+    """
+    Selects a set of models to onload by maximizing a submodular utility function.
+
+    Args:
+        V (float): Lyapunov parameter for onloading decisions
+        prev_onloaded_models (list): Previously onloaded model IDs
+        memory_capacity (float): Total memory capacity
+        model_sizes (np.array): Array of model sizes indexed by position in available_models
+        onloading_costs (np.array): Array of onloading costs indexed by position in available_models
+        error_rates_dict (dict): ERROR_RATES dictionary structure:
+                                {task_type_str: {model_id: error_rate}}
+        task_dist_estimate (np.array): Estimated task distribution (length = NUM_TASK_TYPES)
+        available_models (list): List of model IDs that can be onloaded (e.g., available_client_models)
+        task_names (list): List of task type names (TASK_NAMES)
+
+    Returns:
+        tuple: (selected_models, total_onloading_cost)
+    """
+    S = set()  # Selected models
+    remaining_capacity = memory_capacity
+    prev_onloaded_set = set(prev_onloaded_models)
+
+    # Create mapping from available_models indices to actual model IDs
+    # available_models contains the actual model IDs we can choose from
+    num_tasks = len(task_names)
+
+    while True:
+        best_model, best_ratio = -1, -np.inf
+
+        # Get candidate models that fit in remaining capacity
+        candidate_models = []
+        for idx, model_id in enumerate(available_models):
+            if model_id not in S:
+                # Check if this model fits
+                if model_sizes[idx] <= remaining_capacity:
+                    candidate_models.append((idx, model_id))
+
+        if not candidate_models:
+            break
+
+        # Calculate the expected error for current set S across all tasks
+        expected_error_S = []
+        for t_idx, task_type in enumerate(task_names):
+            if not S:
+                # No models in S, use worst-case error (1.0)
+                expected_error_S.append(1.0)
+            else:
+                # Find minimum error among models in S for this task
+                errors_for_task = []
+                for model_id in S:
+                    if model_id in error_rates_dict[task_type]:
+                        errors_for_task.append(error_rates_dict[task_type][model_id])
+
+                if errors_for_task:
+                    expected_error_S.append(min(errors_for_task))
+                else:
+                    # None of the models in S have error rates for this task
+                    expected_error_S.append(1.0)
+
+        # Evaluate each candidate model
+        for idx, model_id in candidate_models:
+            # Calculate marginal gain for adding this model
+            sum_task_acc_gain = 0.0
+
+            # Create temporary set with candidate model
+            S_plus_m = S.union({model_id})
+
+            # Calculate expected error with S + {m} for each task
+            for t_idx, task_type in enumerate(task_names):
+                # Find minimum error with S + {m}
+                errors_for_task_plus_m = []
+                for m in S_plus_m:
+                    if m in error_rates_dict[task_type]:
+                        errors_for_task_plus_m.append(error_rates_dict[task_type][m])
+
+                if errors_for_task_plus_m:
+                    error_S_plus_m = min(errors_for_task_plus_m)
+                else:
+                    error_S_plus_m = 1.0
+
+                # Calculate marginal accuracy gain
+                # Gain = reduction in error weighted by task probability
+                accuracy_gain = V * task_dist_estimate[t_idx] * (expected_error_S[t_idx] - error_S_plus_m)
+                sum_task_acc_gain += accuracy_gain
+
+            # Calculate onloading cost (only pay if model wasn't previously onloaded)
+            cost_increase = onloading_costs[idx] if model_id not in prev_onloaded_set else 0
+
+            # Calculate marginal gain (benefit - cost)
+            marginal_gain = sum_task_acc_gain - cost_increase
+
+            # Calculate ratio (gain per unit memory)
+            if marginal_gain > 0:
+                ratio = marginal_gain / model_sizes[idx]
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_model = model_id
+                    best_idx = idx
+
+        # If no model provides positive marginal gain, stop
+        if best_model == -1:
+            break
+
+        # Add best model to selection
+        S.add(best_model)
+        remaining_capacity -= model_sizes[best_idx]
+
+    # Calculate total onloading cost (only for newly onloaded models)
+    total_cost = 0.0
+    for idx, model_id in enumerate(available_models):
+        if model_id in S and model_id not in prev_onloaded_set:
+            total_cost += onloading_costs[idx]
+
+    return list(S), total_cost
 
 def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
                                 cost_budget_gamma_c, cost_budget_gamma_e,
                                 initial_bias_strength=0.0,
                                 use_variance_reduction=False,
-                                cost_std=0.05):
+                                cost_std=0.05, enable_onloading=True):
     """
     Implements the hierarchical EXP4 algorithm with separate virtual queues
     and practical partial feedback (only when both client and edge offload).
@@ -88,7 +227,27 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
     Q_c = 0.0  # Client-to-edge queue
     Q_e = 0.0  # Edge-to-cloud queue
 
+    # Initialize onloaded models
+    onloaded_client = initialize_onloaded_models(CLIENT_MEMORY_CAPACITY,
+                                                 np.array(available_client_models),
+                                                 MODEL_SIZES)
+    onloaded_edge = initialize_onloaded_models(EDGE_MEMORY_CAPACITY,
+                                               np.array(available_edge_models),
+                                               MODEL_SIZES)
+
+    if not enable_onloading:
+        # Fix models to initial selection
+        onloaded_client = available_client_models
+        onloaded_edge = available_edge_models
+
     task_counts = {t: 0 for t in TASK_NAMES}
+
+    # Track offloading probabilities for onloading decisions
+    epoch_offload_c_sum = {t: 0.0 for t in TASK_NAMES}
+    epoch_offload_e_sum = {t: 0.0 for t in TASK_NAMES}
+    epoch_task_counts = {t: 0 for t in TASK_NAMES}
+    offload_c_probs = {t: 0.5 for t in TASK_NAMES}
+    offload_e_probs = {t: 0.5 for t in TASK_NAMES}
 
     # For variance reduction: track estimated costs and error rates
     if use_variance_reduction:
@@ -101,18 +260,89 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
         'queue_client': [], 'queue_edge': [],
         'client_weight_entropy': [], 'edge_weight_entropy': [],
         'offload_client': [], 'offload_edge': [], 'feedback_received': [],
-        'actual_costs_client': [], 'actual_costs_edge': []
+        'actual_costs_client': [], 'actual_costs_edge': [],
+        'onload_costs': [],  # Add this
+        'onloaded_client_history': [list(onloaded_client)],  # Add this
+        'onloaded_edge_history': [list(onloaded_edge)]  # Add this
     }
 
     # --- Main Simulation Loop ---
     for j in range(num_jobs):
+
+        # ----------------------onload----------------------
+        if enable_onloading and j > 0 and j % ONLOADING_EPOCH_LENGTH == 0:
+            # Estimate task distribution
+            total_tasks = sum(task_counts.values())
+            task_dist_array = np.array([task_counts[t] / (total_tasks + 1e-9) for t in TASK_NAMES])
+
+            # Update average offloading probabilities from past epoch
+            for t in TASK_NAMES:
+                if epoch_task_counts[t] > 0:
+                    offload_c_probs[t] = epoch_offload_c_sum[t] / epoch_task_counts[t]
+                    offload_e_probs[t] = epoch_offload_e_sum[t] / epoch_task_counts[t]
+
+            # Estimate task distribution for client (processes locally)
+            task_dist_c = np.array([task_dist_array[i] * (1 - offload_c_probs[TASK_NAMES[i]])
+                                    for i in range(NUM_TASK_TYPES)])
+
+            # Client onloading decision
+            client_model_sizes = MODEL_SIZES[available_client_models]
+            client_onload_costs = MODEL_ONLOADING_COSTS[available_client_models]
+            onloaded_client, cost_c = enhanced_greedy_onloading(
+                    V=V_ONLOAD,
+                    prev_onloaded_models=onloaded_client,
+                    memory_capacity=CLIENT_MEMORY_CAPACITY,
+                    model_sizes=client_model_sizes,
+                    onloading_costs=client_onload_costs,
+                    error_rates_dict=ERROR_RATES,
+                    task_dist_estimate=task_dist_c,
+                    available_models=available_client_models,  # [2, 3, 5, 6]
+                    task_names=TASK_NAMES
+                )
+
+            # Estimate task distribution for edge (client offloads but edge processes)
+            task_dist_e = np.array([task_dist_array[i] * offload_c_probs[TASK_NAMES[i]] *
+                                    (1 - offload_e_probs[TASK_NAMES[i]])
+                                    for i in range(NUM_TASK_TYPES)])
+
+            # Edge onloading decision
+            edge_model_sizes = MODEL_SIZES[available_edge_models]
+            edge_onload_costs = MODEL_ONLOADING_COSTS[available_edge_models]
+
+            onloaded_edge, cost_e = enhanced_greedy_onloading(
+                V=V_ONLOAD,
+                prev_onloaded_models=onloaded_edge,
+                memory_capacity=EDGE_MEMORY_CAPACITY,
+                model_sizes=edge_model_sizes,
+                onloading_costs=edge_onload_costs,
+                error_rates_dict=ERROR_RATES,
+                task_dist_estimate=task_dist_e,
+                available_models=available_edge_models,  # [0, 1, 4, 7]
+                task_names=TASK_NAMES
+            )
+
+            # Record decisions
+            history['onload_costs'].append(cost_c + cost_e)
+            history['onloaded_client_history'].append(list(onloaded_client))
+            history['onloaded_edge_history'].append(list(onloaded_edge))
+
+            # Reset epoch counters
+            epoch_offload_c_sum = {t: 0.0 for t in TASK_NAMES}
+            epoch_offload_e_sum = {t: 0.0 for t in TASK_NAMES}
+            epoch_task_counts = {t: 0 for t in TASK_NAMES}
+        else:
+            history['onload_costs'].append(0)
+        # ----------onload end------------------
+
+
+
         # Select one value, range from 0 to TOTAL_JOBS
         idx = random.randint(0, num_jobs - 1)
         task_type = data['full_data'][idx]['category']
         task_type_idx = TASK_NAMES.index(task_type)
-        # here we ignore onloading, need to add the onloading problem in the future
-        client_err, best_client_model = lowest_avg_error(ERROR_RATES[task_type], available_client_models)
-        edge_err, best_edge_model = lowest_avg_error(ERROR_RATES[task_type], available_edge_models)
+        epoch_task_counts[task_type] += 1
+        client_err, best_client_model = lowest_avg_error(ERROR_RATES[task_type], onloaded_client)
+        edge_err, best_edge_model = lowest_avg_error(ERROR_RATES[task_type], onloaded_edge)
         # cloud_err = ERROR_RATES[task_type][2]
         mean_confidence = 1.0 - client_err
         std_dev = 0.1
@@ -131,6 +361,10 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
         client_offload_experts = expert_thresholds > confidence_Z
         prob_offload_c = np.sum(w_client[task_type_idx, client_offload_experts])
         prob_offload_c = np.clip(prob_offload_c, 1e-5, 1 - 1e-5)
+
+        epoch_offload_c_sum[task_type] += prob_offload_c
+
+
 
         # Sample client decision
         o_c = 1 if np.random.rand() < prob_offload_c else 0
@@ -151,6 +385,8 @@ def exp4_hierarchical_algorithm(num_jobs, num_experts, learning_rate, v_param,
             o_e = 1 if np.random.rand() < prob_offload_e else 0
         else:
             prob_offload_e = 0.5  # Default value when not relevant
+
+        epoch_offload_e_sum[task_type] += prob_offload_e
 
         # --- DETERMINE JOB ERROR ---
         if o_c == 0:
@@ -349,10 +585,25 @@ def aggregate_results(all_histories):
     """Averages results over multiple trials and calculates standard deviation."""
     aggregated = {}
     keys = all_histories[0].keys()
+
+    # Define which keys should NOT be aggregated (non-numeric or variable-length lists)
+    skip_keys = {'onloaded_client_history', 'onloaded_edge_history'}
+
     for key in keys:
-        stacked = np.array([h[key] for h in all_histories])
-        aggregated[f'{key}_mean'] = np.mean(stacked, axis=0)
-        aggregated[f'{key}_std'] = np.std(stacked, axis=0)
+        if key in skip_keys:
+            # For model history, just keep the first trial's data for reference
+            aggregated[key] = all_histories[0][key]
+            continue
+
+        try:
+            stacked = np.array([h[key] for h in all_histories])
+            aggregated[f'{key}_mean'] = np.mean(stacked, axis=0)
+            aggregated[f'{key}_std'] = np.std(stacked, axis=0)
+        except ValueError as e:
+            # If stacking fails, skip this key
+            print(f"Warning: Could not aggregate key '{key}': {e}")
+            aggregated[key] = all_histories[0][key]
+
     return aggregated
 
 
@@ -496,12 +747,12 @@ def plot_learning_comparison(agg_no_vr, agg_vr, num_jobs):
 
 if __name__ == '__main__':
     # --- Simulation Parameters ---
-    NUM_TRIALS = 5
+    NUM_TRIALS = 10
     NUM_JOBS = 40000
     NUM_EXPERTS = 50
     LEARNING_RATE_ETA = 0.01
     V_PARAM = 500
-    COST_BUDGET_GAMMA_C = 1.0  # Client-to-edge budget
+    COST_BUDGET_GAMMA_C = 0.5  # Client-to-edge budget
     COST_BUDGET_GAMMA_E = 0.5  # Edge-to-cloud budget
     INITIAL_BIAS_STRENGTH = 0.0
     COST_STD = 0.05  # Standard deviation for cost randomness
@@ -548,23 +799,26 @@ if __name__ == '__main__':
     agg_vr = aggregate_results(all_results_vr)
 
     # Print summary statistics
-    print("\n=== SUMMARY STATISTICS ===")
-    print(f"\nWithout Variance Reduction:")
-    print(f"  Final avg error rate: {np.mean(agg_no_vr['errors_mean'][-1000:]):.4f}")
-    print(f"  Final avg client cost: {np.mean(agg_no_vr['costs_client_mean'][-1000:]):.4f}")
-    print(f"  Final avg edge cost: {np.mean(agg_no_vr['costs_edge_mean'][-1000:]):.4f}")
-    print(f"  Final avg feedback rate: {np.mean(agg_no_vr['feedback_received_mean'][-1000:]):.4f}")
-    print(f"  Final client queue: {np.mean(agg_no_vr['queue_client_mean'][-1000:]):.2f}")
-    print(f"  Final edge queue: {np.mean(agg_no_vr['queue_edge_mean'][-1000:]):.2f}")
-
-    print(f"\nWith Variance Reduction:")
-    print(f"  Final avg error rate: {np.mean(agg_vr['errors_mean'][-1000:]):.4f}")
-    print(f"  Final avg client cost: {np.mean(agg_vr['costs_client_mean'][-1000:]):.4f}")
-    print(f"  Final avg edge cost: {np.mean(agg_vr['costs_edge_mean'][-1000:]):.4f}")
-    print(f"  Final avg feedback rate: {np.mean(agg_vr['feedback_received_mean'][-1000:]):.4f}")
-    print(f"  Final client queue: {np.mean(agg_vr['queue_client_mean'][-1000:]):.2f}")
-    print(f"  Final edge queue: {np.mean(agg_vr['queue_edge_mean'][-1000:]):.2f}")
+    # print("\n=== SUMMARY STATISTICS ===")
+    # print(f"\nWithout Variance Reduction:")
+    # print(f"  Final avg error rate: {np.mean(agg_no_vr['errors_mean'][-1000:]):.4f}")
+    # print(f"  Final avg client cost: {np.mean(agg_no_vr['costs_client_mean'][-1000:]):.4f}")
+    # print(f"  Final avg edge cost: {np.mean(agg_no_vr['costs_edge_mean'][-1000:]):.4f}")
+    # print(f"  Final avg feedback rate: {np.mean(agg_no_vr['feedback_received_mean'][-1000:]):.4f}")
+    # print(f"  Final client queue: {np.mean(agg_no_vr['queue_client_mean'][-1000:]):.2f}")
+    # print(f"  Final edge queue: {np.mean(agg_no_vr['queue_edge_mean'][-1000:]):.2f}")
+    #
+    # print(f"\nWith Variance Reduction:")
+    # print(f"  Final avg error rate: {np.mean(agg_vr['errors_mean'][-1000:]):.4f}")
+    # print(f"  Final avg client cost: {np.mean(agg_vr['costs_client_mean'][-1000:]):.4f}")
+    # print(f"  Final avg edge cost: {np.mean(agg_vr['costs_edge_mean'][-1000:]):.4f}")
+    # print(f"  Final avg feedback rate: {np.mean(agg_vr['feedback_received_mean'][-1000:]):.4f}")
+    # print(f"  Final client queue: {np.mean(agg_vr['queue_client_mean'][-1000:]):.2f}")
+    # print(f"  Final edge queue: {np.mean(agg_vr['queue_edge_mean'][-1000:]):.2f}")
 
     print("\nSimulations finished. Plotting comparison results...")
     plot_performance_comparison(agg_no_vr, agg_vr, COST_BUDGET_GAMMA_C, COST_BUDGET_GAMMA_E, NUM_JOBS)
     # plot_learning_comparison(agg_no_vr, agg_vr, NUM_JOBS)
+
+
+#  estimate error rates without bias
