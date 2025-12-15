@@ -541,7 +541,7 @@ def plot_performance_comparison(agg_no_vr, agg_vr, cost_budget_gamma_c, cost_bud
     axes[1, 1].legend()
 
     plt.tight_layout()
-    plt.show()
+    plt.savefig('variance_reduction_performance_comparison.png')
 
 
 if __name__ == '__main__':
@@ -551,7 +551,7 @@ if __name__ == '__main__':
     LEARNING_RATE_ETA = 0.01
     V_PARAM = 500
     COST_BUDGET_GAMMA_C = 0.5
-    COST_BUDGET_GAMMA_E = 0.1
+    COST_BUDGET_GAMMA_E = 0.5
     COST_STD = 0.05
 
     all_results_no_vr, all_results_vr = [], []

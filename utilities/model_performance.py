@@ -18,7 +18,7 @@ def estimate_model_perforance(data):
     all_categories = data['task_types']  # Get list of all possible task types
 
     # Randomly select 500 samples
-    sample_num = 500
+    sample_num = 2000
     sampled_indices = random.sample(all_indices, sample_num)
 
     # Initialize accumulators for ALL categories to ensure coverage
@@ -71,7 +71,7 @@ def estimate_offloadingCost(data, scale):
     all_categories = data['task_types']  # Ensure we know all possible categories
 
     # Randomly select 500 samples
-    sample_num = 500
+    sample_num = 2000
     sampled_indices = random.sample(all_indices, sample_num)
 
     # Initialize accumulators for ALL categories
