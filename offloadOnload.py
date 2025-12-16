@@ -33,23 +33,23 @@ def get_system_configs():
         'num_layers': 3, 'nodes_per_layer': [1, 1, 1],
         'layer_configs': [
             {'memory': 17, 'models': [0, 2, 3, 5, 6], 'gamma': 0},
-            {'memory': 85, 'models': [1, 4, 7], 'gamma': 0.5},
-            {'gamma': 0.5},
+            {'memory': 85, 'models': [1, 4, 7], 'gamma': 0.4},
+            {'gamma': 0.4},
         ],
     }
     configs['3layer_4-2-1'] = {
         'num_layers': 3, 'nodes_per_layer': [4, 2, 1],
         'layer_configs': [
             {'memory': 17, 'models': [0, 2, 3, 5, 6], 'gamma': 0},
-            {'memory': 85, 'models': [1, 4, 7], 'gamma': 0.5},
-            {'gamma': 0.5},
+            {'memory': 85, 'models': [1, 4, 7], 'gamma': 0.4},
+            {'gamma': 0.4},
         ],
     }
     configs['4layer_1-1-1-1'] = {
         'num_layers': 4, 'nodes_per_layer': [1, 1, 1, 1],
         'layer_configs': [
             {'memory': 8, 'models': [0, 5, 6], 'gamma': 0},
-            {'memory': 20, 'models': [0, 2, 5, 6], 'gamma': 0.4},
+            {'memory': 60, 'models': [0, 2, 5, 6], 'gamma': 0.4},
             {'memory': 85, 'models': [1, 3, 4, 7], 'gamma': 0.4},
             {'gamma': 0.4},
         ],
@@ -58,7 +58,7 @@ def get_system_configs():
         'num_layers': 4, 'nodes_per_layer': [8, 4, 2, 1],
         'layer_configs': [
             {'memory': 8, 'models': [0, 5, 6], 'gamma': 0},
-            {'memory': 20, 'models': [0, 2, 5, 6], 'gamma': 0.4},
+            {'memory': 60, 'models': [0, 2, 5, 6], 'gamma': 0.4},
             {'memory': 85, 'models': [1, 3, 4, 7], 'gamma': 0.4},
             {'gamma': 0.4},
         ],
@@ -220,6 +220,9 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         'node_queues': {n.node_id: [] for n in system.nodes.values() if n.Q is not None},
         'node_offload_decisions': {n.node_id: [] for n in system.get_non_cloud_nodes()},
         'feedback_received': [], 'onload_costs': [], 'execution_layer': [],
+        # Track loss value per update for each node (only when node is updated)
+        # Each entry is the sum of L_hat for that job
+        'node_loss_values': {n.node_id: [] for n in system.get_non_cloud_nodes()},
     }
 
     for j in range(num_jobs):
@@ -470,10 +473,20 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
             # Update cumulative loss
             node.S[task_type_idx] += L_hat
 
+            # Record the total loss for this job (sum of L_hat across all experts)
+            history['node_loss_values'][node.node_id].append(np.sum(L_hat))
+
             # Normalize weights
             log_w = -learning_rate * node.S[task_type_idx]
             log_w_shifted = log_w - np.max(log_w)
             node.w[task_type_idx] = np.exp(log_w_shifted) / np.sum(np.exp(log_w_shifted))
+
+        # For layer 0 (starting) node: record 0 if it wasn't updated (no-VR without feedback)
+        start_node_id = start_node.node_id
+        updated_node_ids = set(n.node_id for n in nodes_to_update)
+        if start_node_id not in updated_node_ids:
+            # This happens for no-VR without feedback
+            history['node_loss_values'][start_node_id].append(0.0)
 
         # Update queues
         visited_ids = set(n.node_id for n in visited_path[:-1]) if visited_path[
@@ -551,13 +564,18 @@ def compute_offload_loss_recursive_actual(full_path, node_idx, offload_probs, be
 
 def aggregate_results(all_histories):
     aggregated = {}
-    skip = {'node_costs', 'node_queues', 'node_offload_decisions'}
+    # These fields have variable length per node, don't try to stack them
+    skip = {'node_costs', 'node_queues', 'node_offload_decisions', 'node_loss_values'}
     for key in all_histories[0].keys():
         if key in skip:
             aggregated[key] = {}
             for nid in all_histories[0][key].keys():
-                stacked = np.array([h[key][nid] for h in all_histories])
-                aggregated[key][nid] = {'mean': np.mean(stacked, axis=0), 'std': np.std(stacked, axis=0)}
+                # For node_loss_values, just collect all values from all trials
+                if key == 'node_loss_values':
+                    aggregated[key][nid] = [h[key][nid] for h in all_histories]
+                else:
+                    stacked = np.array([h[key][nid] for h in all_histories])
+                    aggregated[key][nid] = {'mean': np.mean(stacked, axis=0), 'std': np.std(stacked, axis=0)}
         else:
             try:
                 stacked = np.array([h[key] for h in all_histories])
@@ -568,70 +586,172 @@ def aggregate_results(all_histories):
     return aggregated
 
 
-def plot_results(agg_no_vr, agg_vr, system, num_jobs, prefix='results'):
+def plot_results(agg_no_vr, agg_vr, all_no_vr, all_vr, system, num_jobs, prefix='results'):
+    """Plot main performance results"""
     jobs = np.arange(num_jobs)
-    fig, axes = plt.subplots(2, 2, figsize=(20, 12))
-    fig.suptitle(f'{system.num_layers}-Layer Performance ({system.nodes_per_layer})', fontsize=26)
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    fig.suptitle(f'{system.num_layers}-Layer Performance ({system.nodes_per_layer})', fontsize=16)
 
+    # Error rate
     axes[0, 0].plot(jobs, np.cumsum(agg_no_vr['errors_mean']) / (jobs + 1), label='No VR')
     axes[0, 0].plot(jobs, np.cumsum(agg_vr['errors_mean']) / (jobs + 1), '--', label='With VR')
-    axes[0, 0].set_ylabel('Avg Error Rate', fontsize=20)
-    axes[0, 0].legend(fontsize=20)
+    axes[0, 0].set_ylabel('Avg Error Rate')
+    axes[0, 0].set_xlabel('Jobs')
+    axes[0, 0].legend();
     axes[0, 0].grid(True)
 
+    # Feedback rate
     axes[0, 1].plot(jobs, np.cumsum(agg_no_vr['feedback_received_mean']) / (jobs + 1), label='No VR')
     axes[0, 1].plot(jobs, np.cumsum(agg_vr['feedback_received_mean']) / (jobs + 1), '--', label='With VR')
-    axes[0, 1].set_ylabel('Feedback Rate', fontsize=20)
-    axes[0, 1].legend(fontsize=20)
+    axes[0, 1].set_ylabel('Feedback Rate')
+    axes[0, 1].set_xlabel('Jobs')
+    axes[0, 1].legend();
     axes[0, 1].grid(True)
 
+    # # Total cost
     # axes[0, 2].plot(jobs, np.cumsum(agg_no_vr['costs_total_mean']) / (jobs + 1), label='No VR')
     # axes[0, 2].plot(jobs, np.cumsum(agg_vr['costs_total_mean']) / (jobs + 1), '--', label='With VR')
     # budget = sum(n.cost_budget_gamma for n in system.nodes.values() if n.Q is not None)
     # axes[0, 2].axhline(budget, color='r', linestyle=':', label=f'Budget={budget:.2f}')
     # axes[0, 2].set_ylabel('Avg Total Cost')
+    # axes[0, 2].set_xlabel('Jobs')
     # axes[0, 2].legend();
     # axes[0, 2].grid(True)
 
+    # Per-node costs
     for nid in list(agg_no_vr['node_costs'].keys())[:6]:
         axes[1, 0].plot(jobs, np.cumsum(agg_no_vr['node_costs'][nid]['mean']) / (jobs + 1), label=nid, alpha=0.7)
-    axes[1, 0].set_ylabel('Avg Cost/Node', fontsize=20)
-    axes[1, 0].legend(fontsize=20)
+    axes[1, 0].set_ylabel('Avg Cost/Node')
+    axes[1, 0].set_xlabel('Jobs')
+    axes[1, 0].legend(fontsize=8);
     axes[1, 0].grid(True)
 
+    # Queue sizes
     # for nid in list(agg_no_vr['node_queues'].keys())[:6]:
     #     axes[1, 1].plot(jobs, agg_no_vr['node_queues'][nid]['mean'], label=nid, alpha=0.7)
-    # axes[1, 1].set_ylabel('Queue Size');
+    # axes[1, 1].set_ylabel('Queue Size')
+    # axes[1, 1].set_xlabel('Jobs')
     # axes[1, 1].legend(fontsize=8);
     # axes[1, 1].grid(True)
 
-    # wrong
-    # exec_no = np.bincount(agg_no_vr['execution_layer_mean'].astype(int), minlength=system.num_layers)
+    # Execution distribution - FIXED: compute histogram per trial, then average
     exec_no = np.zeros(system.num_layers)
-    for h in all_no_vr:  # Need raw histories, not aggregated
+    exec_vr = np.zeros(system.num_layers)
+    for h in all_no_vr:
         counts = np.bincount(np.array(h['execution_layer']).astype(int), minlength=system.num_layers)
         exec_no += counts
-    exec_no /= len(all_no_vr)
-
-    # exec_vr = np.bincount(agg_vr['execution_layer_mean'].astype(int), minlength=system.num_layers)
-    exec_vr = np.zeros(system.num_layers)
-    for h in all_no_vr:  # Need raw histories, not aggregated
+    for h in all_vr:
         counts = np.bincount(np.array(h['execution_layer']).astype(int), minlength=system.num_layers)
         exec_vr += counts
-    exec_vr /= len(all_no_vr)
-
+    exec_no /= len(all_no_vr)
+    exec_vr /= len(all_vr)
 
     x = np.arange(system.num_layers)
     axes[1, 1].bar(x - 0.175, exec_no, 0.35, label='No VR')
     axes[1, 1].bar(x + 0.175, exec_vr, 0.35, label='With VR')
     axes[1, 1].set_xticks(x)
-    axes[1, 1].set_ylabel('Jobs', fontsize=20)
-    axes[1, 1].legend(fontsize=20)
+    axes[1, 1].set_xticklabels([f'L{i}' for i in range(system.num_layers)])
+    axes[1, 1].set_ylabel('Jobs Executed')
+    axes[1, 1].set_title('Execution Distribution')
+    axes[1, 1].legend();
     axes[1, 1].grid(True, axis='y')
 
     plt.tight_layout()
     plt.savefig(f'{prefix}_performance.png', dpi=300, bbox_inches='tight')
     print(f"Saved {prefix}_performance.png")
+    plt.close()
+
+
+def plot_layer0_loss(all_no_vr, all_vr, system, prefix='results'):
+    """
+    Plot loss values for layer 0 (initial layer) nodes.
+
+    X-axis: count of jobs received by that node
+    Y-axis: sum of L_hat (loss estimate) for that job
+
+    For no-VR: loss is 0 when no feedback (not updated)
+    For VR: loss uses baseline even without feedback
+    """
+    # Get layer 0 node IDs
+    layer0_nodes = [n.node_id for n in system.get_non_cloud_nodes() if n.level == 0]
+    num_nodes = len(layer0_nodes)
+
+    # Create figure - one subplot per layer 0 node
+    cols = min(num_nodes, 4)
+    rows = (num_nodes + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
+    fig.suptitle(f'Loss Values for Layer 0 Nodes ({system.num_layers}-Layer, {system.nodes_per_layer})', fontsize=14)
+
+    for idx, nid in enumerate(layer0_nodes):
+        row, col = idx // cols, idx % cols
+        ax = axes[row, col]
+
+        # Get loss values from first trial (for clarity, or could average)
+        loss_no_vr = all_no_vr[0]['node_loss_values'][nid]
+        loss_vr = all_vr[0]['node_loss_values'][nid]
+
+        # X-axis: job count for this node
+        x_no_vr = np.arange(1, len(loss_no_vr) + 1)
+        x_vr = np.arange(1, len(loss_vr) + 1)
+
+        # Plot
+        ax.scatter(x_no_vr, loss_no_vr, s=1, alpha=0.3, label='No VR', color='blue')
+        ax.scatter(x_vr, loss_vr, s=1, alpha=0.3, label='With VR', color='orange')
+
+        ax.set_xlabel('Job Count (for this node)')
+        ax.set_ylabel('Loss (sum of L_hat)')
+        ax.set_title(f'{nid}')
+        ax.legend(markerscale=5)
+        ax.grid(True, alpha=0.3)
+
+    # Hide unused subplots
+    for idx in range(num_nodes, rows * cols):
+        row, col = idx // cols, idx % cols
+        axes[row, col].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig(f'{prefix}_layer0_loss.png', dpi=300, bbox_inches='tight')
+    print(f"Saved {prefix}_layer0_loss.png")
+    plt.close()
+
+    # Also create a zoomed-in version showing rolling statistics
+    fig2, axes2 = plt.subplots(1, 1, figsize=(5, 5))
+    fig2.suptitle(f'Loss Statistics for Layer 0 ({system.num_layers}-Layer)', fontsize=14)
+
+    # Pick first layer 0 node for detailed analysis
+    nid = layer0_nodes[0]
+    loss_no_vr = np.array(all_no_vr[0]['node_loss_values'][nid])
+    loss_vr = np.array(all_vr[0]['node_loss_values'][nid])
+
+    # Rolling mean
+    window = 200
+    if len(loss_no_vr) > window:
+        roll_no = np.convolve(loss_no_vr, np.ones(window) / window, mode='valid')
+        roll_vr = np.convolve(loss_vr, np.ones(window) / window, mode='valid')
+        axes2.plot(roll_no, label='No VR', alpha=0.8)
+        axes2.plot(roll_vr, label='With VR', alpha=0.8)
+        axes2.set_xlabel('Job Count')
+        axes2.set_ylabel(f'Rolling Mean Loss (window={window})')
+        axes2.set_title(f'{nid}: Rolling Mean')
+        axes2.legend();
+        axes2.grid(True)
+
+    # # Rolling variance (standard deviation)
+    # if len(loss_no_vr) > window:
+    #     # Compute rolling std
+    #     roll_std_no = np.array([np.std(loss_no_vr[max(0, i - window):i]) for i in range(window, len(loss_no_vr))])
+    #     roll_std_vr = np.array([np.std(loss_vr[max(0, i - window):i]) for i in range(window, len(loss_vr))])
+    #     axes2[1].plot(roll_std_no, label='No VR', alpha=0.8)
+    #     axes2[1].plot(roll_std_vr, label='With VR', alpha=0.8)
+    #     axes2[1].set_xlabel('Job Count')
+    #     axes2[1].set_ylabel(f'Rolling Std Dev (window={window})')
+    #     axes2[1].set_title(f'{nid}: Rolling Std (Variance Reduction Effect)')
+    #     axes2[1].legend();
+    #     axes2[1].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(f'{prefix}_layer0_loss_stats.png', dpi=300, bbox_inches='tight')
+    print(f"Saved {prefix}_layer0_loss_stats.png")
     plt.close()
 
 
@@ -644,7 +764,6 @@ if __name__ == '__main__':
 
     configs = get_system_configs()
     to_run = ['3layer_1-1-1', '3layer_4-2-1', '4layer_1-1-1-1', '4layer_8-4-2-1']
-    # , '3layer_4-2-1', '4layer_1-1-1-1', '4layer_8-4-2-1'
 
     for name in to_run:
         cfg = configs[name]
@@ -668,7 +787,8 @@ if __name__ == '__main__':
         agg_vr = aggregate_results(all_vr)
 
         system = HierarchicalSystem(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'])
-        plot_results(agg_no, agg_vr, system, NUM_JOBS, prefix=name)
+        plot_results(agg_no, agg_vr, all_no_vr, all_vr, system, NUM_JOBS, prefix=name)
+        plot_layer0_loss(all_no_vr, all_vr, system, prefix=name)
 
         print(f"\n--- {name} Results ---")
         print(

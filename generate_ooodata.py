@@ -276,4 +276,4 @@ with open(f'data/ooo_dataset/ooo_dataset1.pkl', 'rb') as f:
 # print(ooo_dataset['mmlu_pro']['doc'][3].keys())
 print(len(ooo_dataset['task_types']))
 print(ooo_dataset['total_samples'])
-print(ooo_dataset['full_data'][28769])
+print(ooo_dataset['full_data'][289])
