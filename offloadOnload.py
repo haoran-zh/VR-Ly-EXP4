@@ -460,14 +460,14 @@ def loss_recursive_exp(node, v_param, system, use_variance_reduction, if_feedbac
                              node.p_offload * parent.Q * (residual_C + node.C_hat))
         else:
             node.exp_loss = (v_param * (1 - node.p_offload) * (residual_b + node.b_hat) +
-                             node.p_offload * parent.Q * (residual_C + node.C_hat) + parent.exp_loss)
+                             node.p_offload * (parent.Q * (residual_C + node.C_hat) + parent.exp_loss))
     else:  # without VR
         if parent.level == system.num_layers - 1: # end of the recurse, parent is the cloud
             node.exp_loss = (v_param * (1 - node.p_offload) * node.b_true
                              + node.p_offload * parent.Q * node.C_true)
         else:
             node.exp_loss = (v_param * (1 - node.p_offload) * node.b_true
-                             + node.p_offload * parent.Q * node.C_true + parent.exp_loss)
+                             + node.p_offload * (parent.Q * node.C_true + parent.exp_loss))
 
 
 def loss_recursive_actual(node, v_param, system, a, expert_thresholds, use_variance_reduction, if_feedback):
@@ -482,14 +482,14 @@ def loss_recursive_actual(node, v_param, system, a, expert_thresholds, use_varia
                              o_hat_a * parent.Q * (residual_C + node.C_hat))
         else:
             node.actual_loss[a] = (v_param * (1 - o_hat_a) * (residual_b + node.b_hat) +
-                             o_hat_a * parent.Q * (residual_C + node.C_hat) + parent.exp_loss)
+                             o_hat_a * (parent.Q * (residual_C + node.C_hat) + parent.exp_loss))
     else:  # without VR
         if parent.level == system.num_layers - 1: # end of the recurse, parent is the cloud
             node.actual_loss[a] = (v_param * (1 - o_hat_a) * node.b_true
                              + o_hat_a * parent.Q * node.C_true)
         else:
             node.actual_loss[a] = (v_param * (1 - o_hat_a) * node.b_true
-                             + o_hat_a * parent.Q * node.C_true + parent.exp_loss)
+                             + o_hat_a * (parent.Q * node.C_true + parent.exp_loss))
 
 
 
