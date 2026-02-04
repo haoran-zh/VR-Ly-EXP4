@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from utilities.model_performance import model_perforance_GT, estimate_model_perforance, convert_offloadingCost, estimate_offloadingCost, \
     lowest_avg_error
-from utilities.system import HierarchicalNode, HierarchicalSystem
+from utilities.system import HierarchicalNode, HierarchicalSystem, HierarchicalSystemMulti
 import pickle as pkl
 import random
 import copy
@@ -157,23 +157,51 @@ def enhanced_greedy_onloading(V, prev_models, memory, model_sizes, onload_costs,
 
 
 def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
-                     use_variance_reduction=False, enable_onloading=True, initial_error_rates=None):
+                     use_variance_reduction=False, enable_onloading=True, initial_error_rates=None,
+                     exploration_gamma=0.05):
     """
-    Multi-layer EXP4 with CORRECTED:
-    1. Full path computation (leaf to cloud) BEFORE decisions
-    2. Node-specific probability to cloud for importance sampling
-    3. Proper baseline computation for VR
+    Multi-layer EXP4 (bandits with expert advice) for *multi-parent* offloading.
+
+    Key extension vs. the tree case:
+      - Each node n (non-cloud) has K_n candidate parents (upper-layer nodes).
+      - Action set size at node n: K_n + 1 (offload-to-parent-k, or stay).
+      - Experts are indexed by (k, a): parent-index k and threshold-index a.
+        Expert (k, a) chooses:
+            offload to parent k  if theta_a > z
+            stay (process locally) otherwise
+      - Probability over actions:
+            p_k   = sum_a w_{k,a} * 1{theta_a > z},  k=0..K_n-1
+            p_stay= sum_{k,a} w_{k,a} * 1{theta_a <= z}
+        then mix-in exploration: p <- (1-gamma)*p + gamma*Unif(K_n+1)
+
+    Importance sampling:
+      - Let P_cloud(n) be the probability that a job starting at node n eventually reaches cloud
+        under the current (stochastic) policy. In a layered DAG this is computed recursively:
+            P_cloud(cloud)=1
+            P_cloud(n)=sum_{k} p_k(n) * P_cloud(parent_k)
+      - Cloud feedback arrives iff the realized trajectory reaches cloud; IPS uses 1/P_cloud(start).
+
+    The loss recursion also generalizes by using the *expected* parent-Q and expected parent-exp-loss
+    under the conditional distribution over parents given offload.
     """
     expert_thresholds = np.linspace(0, 1, num_experts)
-
 
     ERROR_LEARNING_RATE = 0.05
     MAX_IPS_WEIGHT = 20.0
 
-    # Initialize nodes
+    # -----------------------
+    # Initialize per-node EXP4 tensors
+    # -----------------------
     for node in system.get_non_cloud_nodes():
-        node.S = np.zeros((NUM_TASK_TYPES, num_experts))  # accumulated loss
-        node.w = np.ones((NUM_TASK_TYPES, num_experts)) / num_experts  # weights for each expert
+        # K_n parents; experts are (k,a) pairs
+        if node.level == system.num_layers - 1:
+            continue
+        K_n = len(getattr(node, 'parents', []))
+        node.K_parents = K_n
+        node.num_actions = K_n + 1  # K parents + stay
+        node.S = np.zeros((NUM_TASK_TYPES, node.num_actions, num_experts))  # cumulative loss per (k,a)
+        node.w = np.ones((NUM_TASK_TYPES, node.num_actions, num_experts)) / (node.num_actions * num_experts + 1e-12)
+
         if enable_onloading and len(node.available_models) > 0:
             node.onloaded_models = initialize_onloaded_models(node.memory_capacity, node.available_models)
         else:
@@ -181,17 +209,17 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
 
     task_counts = {t: 0 for t in TASK_NAMES}
     node_task_counts = {n.node_id: {t: 0 for t in TASK_NAMES} for n in system.get_non_cloud_nodes()}
+    # Track empirical offload probability (sum over parents) per node-task
     node_offload_probs = {n.node_id: {t: 0.5 for t in TASK_NAMES} for n in system.get_non_cloud_nodes()}
     epoch_offload_sum = {n.node_id: {t: 0.0 for t in TASK_NAMES} for n in system.get_non_cloud_nodes()}
     epoch_task_counts = {n.node_id: {t: 0 for t in TASK_NAMES} for n in system.get_non_cloud_nodes()}
 
     estimated_error_rates_per_node = {n.node_id: copy.deepcopy(initial_error_rates) for n in system.get_non_cloud_nodes()}
-    # question: what's the difference between node_task_counts and epoch_task_counts
 
-    # Variance reduction control variants setup
+    # Variance reduction control variates
     if use_variance_reduction:
         avg_cost_estimate = {t: avg_offloadCost[t] for t in TASK_NAMES}
-        cost_obs_count = {t: 2000 for t in TASK_NAMES}  # how many samples we use to estimate the avg cost
+        cost_obs_count = {t: 2000 for t in TASK_NAMES}
 
     history = {
         'errors': [], 'costs_total': [],
@@ -199,17 +227,54 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         'node_queues': {n.node_id: [] for n in system.nodes.values() if n.Q is not None},
         'node_offload_decisions': {n.node_id: [] for n in system.get_non_cloud_nodes()},
         'feedback_received': [], 'onload_costs': [], 'execution_layer': [],
-        # Track loss value per update for each node (only when node is updated)
-        # Each entry is the sum of L_hat for that job
         'node_loss_values': {n.node_id: [] for n in system.get_non_cloud_nodes()},
     }
+
+    # Helper: compute action distribution at node given confidence z
+    def compute_action_probs(node, task_type_idx, z):
+        K = node.K_parents  # how many parents
+        if K == 0:
+            # No parents (shouldn't happen except cloud). Force stay.
+            return np.array([1.0])
+        offload_mask = (expert_thresholds > z)  # shape (A,)
+        # p_k: sum_a w_{k,a} 1{theta_a > z}
+        w_k_a = node.w[task_type_idx, :K, offload_mask]  # ignore the last prob (stay)
+        p_parents = np.sum(w_k_a, axis=0)  # (K+1,)
+        # p_stay: sum_{k,a} w_{k,a} 1{theta_a <= z}
+        p_stay = float(np.sum(node.w[task_type_idx, :, ~offload_mask]))
+        p = np.concatenate([p_parents, np.array([p_stay])], axis=0)
+        p = np.clip(p, 1e-12, None)
+        p = p / np.sum(p)
+        # exploration
+        p = (1.0 - exploration_gamma) * p + exploration_gamma * (1.0 / (K + 1))  # the function is defined inside so exploration_gamma is okay
+        p = p / np.sum(p)
+        return p  # p is a vector
+
+    # Helper: compute P_cloud for all nodes (dynamic programming over levels)
+    def compute_prob_to_cloud(all_node_action_probs):
+        P_cloud = {}
+        cloud = system.get_cloud_node()
+        P_cloud[cloud.node_id] = 1.0
+        # process from top-1 down to 0
+        for level in range(system.num_layers - 2, -1, -1):
+            for node in [n for n in system.nodes.values() if n.level == level]:
+                p = all_node_action_probs[node.node_id]  # length K+1
+                K = node.K_parents
+                prob = 0.0
+                for k in range(K):
+                    parent = node.parents[k]
+                    prob += p[k] * P_cloud[parent.node_id]  # conditional probabilty
+                P_cloud[node.node_id] = max(prob, 1e-12)
+        return P_cloud
 
     for j in range(num_jobs):
         if j % 5000 == 0 and j > 0:
             print(f"  Job {j}: err={np.mean(history['errors'][-1000:]):.3f}, "
                   f"fb={np.mean(history['feedback_received'][-1000:]):.3f}")
 
-        # Onloading part
+        # -----------------------
+        # Onloading (unchanged)
+        # -----------------------
         if enable_onloading and j > 0 and j % ONLOADING_EPOCH_LENGTH == 0:
             total_onload_cost = 0
             for node in system.get_non_cloud_nodes():
@@ -221,8 +286,8 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                     if epoch_task_counts[node.node_id][t] > 0:
                         node_offload_probs[node.node_id][t] = epoch_offload_sum[node.node_id][t] / \
                                                               epoch_task_counts[node.node_id][t]
-                local_dist = np.array([task_dist[i] * (1 - node_offload_probs[node.node_id][TASK_NAMES[i]]) for i in
-                                       range(NUM_TASK_TYPES)])
+                local_dist = np.array([task_dist[i] * (1 - node_offload_probs[node.node_id][TASK_NAMES[i]])
+                                       for i in range(NUM_TASK_TYPES)])
                 new_models, cost = enhanced_greedy_onloading(
                     V_ONLOAD, node.onloaded_models, node.memory_capacity,
                     MODEL_SIZES[node.available_models], MODEL_ONLOADING_COSTS[node.available_models],
@@ -236,90 +301,84 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                 epoch_task_counts[node.node_id] = {t: 0 for t in TASK_NAMES}
         else:
             history['onload_costs'].append(0)
-        # TODO: I just skipped reviewing onloading part, I need to come back later.
 
-        # Select job
-        idx = random.randint(0, TOTAL_JOBS - 1)  # decide job idx from all data
+        # -----------------------
+        # Sample a job and starting node
+        # -----------------------
+        idx = random.randint(0, TOTAL_JOBS - 1)
         task_type = data['full_data'][idx]['category']
         task_type_idx = TASK_NAMES.index(task_type)
         task_counts[task_type] += 1
 
-        leaf_nodes = system.get_leaf_nodes()
-        start_node = random.choice(leaf_nodes)
+        start_node = random.choice(system.get_leaf_nodes())
 
-        # Build full path to cloud
-        full_path = []
-        node = start_node
-        while node is not None:
-            full_path.append(node)
-            node = node.parent
-        # full_path = [leaf, ..., cloud]
-
-        # Pre-compute info for ALL nodes on path (except cloud)
-
+        # -----------------------
+        # Pre-compute model confidence + action distributions for *all* non-cloud nodes
+        # (so we can compute P_cloud via DP)
+        # -----------------------
         all_node_best_models = {}
         all_node_confidences = {}
-        all_node_offload_probs = {}
+        all_node_action_probs = {}
 
-        for node in full_path[:-1]:  # Exclude cloud
-            # Error estimate
-            if len(node.onloaded_models) == 0:  # if we don't have available models.
-                # TODO: we will add Video datasets soon, in this part, need to modify.
+        for node in system.get_non_cloud_nodes():
+            # model error estimate for confidence
+            if len(node.onloaded_models) == 0:
                 err_exp, best_model = 1.0, None
             else:
                 err_exp, best_model = lowest_avg_error(ERROR_RATES_GT[task_type], node.onloaded_models)
                 if err_exp is None:
-                    err_exp = 1.0
+                    err_exp, best_model = 1.0, None
             all_node_best_models[node.node_id] = best_model
-
-            # Confidence (same for all nodes)
             confidence = np.clip(np.random.normal(1.0 - err_exp, 0.1), 0, 1)
             all_node_confidences[node.node_id] = confidence
+            node.confidence = confidence  # temp
 
-            # Offload probability from current weights
-            offload_experts = expert_thresholds > confidence
-            prob = np.clip(np.sum(node.w[task_type_idx, offload_experts]), 1e-5, 1 - 1e-5)
-            all_node_offload_probs[node.node_id] = prob
-            node.p_offload = prob
+            # action distribution at this node for this task
+            p = compute_action_probs(node, task_type_idx, confidence)
+            all_node_action_probs[node.node_id] = p
 
-        # ================================================================
-        # Now do the actual traversal (decisions)
-        # ================================================================
+            node.p_offload = float(np.sum(p[:-1]))  # offload probability (sum over parents)
+
+        # Probability-to-cloud for IPS (under the stochastic policy)
+        P_cloud = compute_prob_to_cloud(all_node_action_probs)
+
+        # -----------------------
+        # Realized traversal under sampled actions
+        # -----------------------
         current_node = start_node
         visited_path = [current_node]
-        offload_decisions = {}
+        offload_decisions = {}  # store chosen action index (0..K for each visited node)
         executed_at_node = None
 
-        while current_node is not None:
-            if current_node.level == system.num_layers - 1:  # reach the cloud (if the system only has 1 layer)
+        while True:
+            if current_node.level == system.num_layers - 1:
                 executed_at_node = current_node
                 break
 
             node_task_counts[current_node.node_id][task_type] += 1
             epoch_task_counts[current_node.node_id][task_type] += 1
-            # pseudoTODO: here the offload_sum is the prob sum (seems okay)
-            epoch_offload_sum[current_node.node_id][task_type] += all_node_offload_probs[current_node.node_id]
+            epoch_offload_sum[current_node.node_id][task_type] += float(np.sum(all_node_action_probs[current_node.node_id][:-1]))
 
-            # Make decision
-            prob_offload = all_node_offload_probs[current_node.node_id]
-            o = 1 if np.random.rand() < prob_offload else 0
-            offload_decisions[current_node.node_id] = o
+            p = all_node_action_probs[current_node.node_id]
+            K = current_node.K_parents
+            action = int(np.random.choice(np.arange(K + 1), p=p))
+            offload_decisions[current_node.node_id] = action
 
-            if o == 0:
+            if action == K:  # stay
                 executed_at_node = current_node
                 break
             else:
-                current_node = current_node.parent
-                if current_node is not None:
-                    visited_path.append(current_node)
-                else:
-                    executed_at_node = system.get_cloud_node()
-                    break
+                # offload to selected parent
+                next_node = current_node.parents[action]
+                current_node.to = next_node
+                current_node = next_node
+                visited_path.append(current_node)
 
-
-        # Determine outcome
+        # -----------------------
+        # Determine job error & feedback
+        # -----------------------
         if executed_at_node.level == system.num_layers - 1:
-            job_error = 0
+            job_error = 0  # execute at cloud
         else:
             best_model = all_node_best_models.get(executed_at_node.node_id)
             job_error = 1 if best_model is None else int(1 - data['full_data'][idx]['results'][best_model])
@@ -327,23 +386,14 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         feedback_received = (executed_at_node.level == system.num_layers - 1)
         C_c = convert_offloadingCost(data, sample_idx=idx, scale=OffloadCost_SCALE)
 
-        # ================================================================
-        # Compute node-specific probability to cloud using FULL path
-        # ================================================================
-        node_prob_to_cloud = {}  # we only need this prob when the task offloads to the cloud
-        for path_idx, node in enumerate(full_path[:-1]):  # Exclude cloud
-            prob_to_cloud = 1.0
-            for i in range(path_idx, len(full_path) - 1):
-                prob_to_cloud *= all_node_offload_probs[full_path[i].node_id]
-            node_prob_to_cloud[node.node_id] = max(prob_to_cloud, 1e-9)
-
-        # IPS error rate update (only with feedback)
-        # this is the update for control variants
+        # -----------------------
+        # IPS update for estimated per-node error rates (only when cloud feedback is observed)
+        # -----------------------
         if feedback_received:
-            joint_prob = node_prob_to_cloud[full_path[0].node_id]  # the whole path prob
-            ips_weight = min(1.0 / (joint_prob + 1e-9), MAX_IPS_WEIGHT)
+            joint_prob = P_cloud[start_node.node_id]
+            ips_weight = min(1.0 / (joint_prob + 1e-12), MAX_IPS_WEIGHT)
 
-            for node in full_path[:-1]:
+            for node in system.get_non_cloud_nodes():
                 if len(node.onloaded_models) == 0:
                     continue
                 best_model = all_node_best_models.get(node.node_id)
@@ -360,138 +410,167 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
             avg_cost_estimate[task_type] = (avg_cost_estimate[task_type] * count + C_c) / (count + 1)
             cost_obs_count[task_type] += 1
 
-        # ================================================================
-        # Update EXP4 weights
-        # VR: Update ALL nodes on full_path (except cloud)
-        # Standard: Only update visited nodes when feedback received
-        # ================================================================
+        # -----------------------
+        # EXP4 update set:
+        #   - VR: update all non-cloud nodes (learn even without feedback)
+        #   - no-VR: update only when feedback_received (cloud)
+        # -----------------------
         if use_variance_reduction:
-            nodes_to_update = full_path[-2::-1]  # All except cloud
-        elif feedback_received:  # only without VR can reach this option
-            nodes_to_update = full_path[-2::-1]
-        else:  # if no feedback (without VR)
-            nodes_to_update = []  # without VR, no node to update if no feedback
-        # nodes_to_update is in reverse order, from parent to child
+            nodes_to_update = [n for n in system.get_non_cloud_nodes()]
+        elif feedback_received:
+            nodes_to_update = [n for n in system.get_non_cloud_nodes()]
+        else:
+            nodes_to_update = []
+
+        # Process higher levels first so parent.exp_loss is available for children
+        nodes_to_update = sorted(nodes_to_update, key=lambda n: n.level, reverse=True)
+
+        # Pre-set exp_loss at cloud = 0 for convenience
+        system.get_cloud_node().exp_loss = 0.0
 
         for node in nodes_to_update:
-            # path_idx = full_path.index(node)  # 5->4->3->2->1
+            K = node.K_parents  # how many parents
             node.exp_loss = None
-            node.actual_loss = np.zeros(num_experts)
-            # This node's probability to cloud
-            node.p_to_cloud = node_prob_to_cloud[node.node_id]
-            # Baseline error estimate for this node (for VR)
+            node.actual_loss = np.zeros((node.num_actions, num_experts))
+
+            node.p_to_cloud = P_cloud[node.node_id]
             best_model = all_node_best_models.get(node.node_id)
-            node.b_hat = estimated_error_rates_per_node[node.node_id][task_type][best_model]
-            node.b_true = int(1 - data['full_data'][idx]['results'][best_model]) if feedback_received else node.b_hat
+            if best_model is None:
+                node.b_hat = 1.0
+                node.b_true = 1.0 if feedback_received else 1.0
+            else:
+                node.b_hat = estimated_error_rates_per_node[node.node_id][task_type][best_model]
+                node.b_true = int(1 - data['full_data'][idx]['results'][best_model]) if feedback_received else node.b_hat
+
             node.confidence = all_node_confidences[node.node_id]
             node.C_true = C_c
-            node.C_hat = avg_cost_estimate[task_type] if use_variance_reduction else C_c
+            node.C_hat = (avg_cost_estimate[task_type] if use_variance_reduction else C_c)
 
-            for a in range(num_experts):
-                loss_recursive_exp(node, v_param, system, use_variance_reduction, if_feedback=feedback_received)
-                loss_recursive_actual(node, v_param, system, a, expert_thresholds, use_variance_reduction, if_feedback=feedback_received)
+            # Compute exp_loss once per node (uses node.p_offload + parent expectations)
+            loss_recursive_exp_multi(node, v_param, system, all_node_action_probs, use_variance_reduction, if_feedback=feedback_received)
 
-            # Update cumulative loss
+            # Compute per-expert losses (k,a)
+            for k in range(K):
+                for a in range(num_experts):
+                    loss_recursive_actual_multi(node, v_param, system, k, a, expert_thresholds,
+                                                all_node_action_probs, use_variance_reduction, if_feedback=feedback_received)
+
+            # Accumulate loss and update weights (flatten over (k,a))
             node.S[task_type_idx] += node.actual_loss
 
-            # Record the total loss for this job (sum of L_hat across all experts)
-            # feels useless
-            history['node_loss_values'][node.node_id].append(np.sum(node.actual_loss))
+            history['node_loss_values'][node.node_id].append(float(np.sum(node.actual_loss)))
 
             # Normalize weights
-            log_w = -learning_rate * node.S[task_type_idx]
-            log_w_shifted = log_w - np.max(log_w)  # shifted w may be better
-            node.w[task_type_idx] = np.exp(log_w_shifted) / np.sum(np.exp(log_w_shifted))
-        # set back to None for temp values
+            log_w = -learning_rate * node.S[task_type_idx].reshape(-1)
+            log_w -= np.max(log_w)
+            w_flat = np.exp(log_w)
+            w_flat /= np.sum(w_flat)
+            node.w[task_type_idx] = w_flat.reshape(K+1, num_experts)
+
+            # clear temp
         for node in nodes_to_update:
             node.b_true = None
             node.b_hat = None
             node.C_true = None
             node.C_hat = None
-            node.exp_loss = None
             node.actual_loss = None
             node.p_to_cloud = None
-            node.p_offload = None
             node.confidence = None
+            node.exp_loss = None
 
-        # For layer 0 (starting) node: record 0 if it wasn't updated (no-VR without feedback)
-        start_node_id = start_node.node_id
-        updated_node_ids = set(n.node_id for n in nodes_to_update)
-        if start_node_id not in updated_node_ids:
-            # This happens for no-VR without feedback
-            history['node_loss_values'][start_node_id].append(0.0)
-
-        # Update queues
-        visited_ids = set(n.node_id for n in visited_path[:-1]) if visited_path[
-                                                                       -1].level == system.num_layers - 1 else set(
-            n.node_id for n in visited_path)
-        total_job_cost = 0
-
+        # -----------------------
+        # Update queues and record metrics (same structure as original)
+        # Queue updates only apply to non-initial, non-cloud nodes (Q != None).
+        # For multi-parent, the queue update is applied to each *visited* parent node that received the job.
+        # -----------------------
+        total_job_cost = 0.0
+        # record decisions
         for node in system.get_non_cloud_nodes():
-            if node.node_id in visited_ids and offload_decisions.get(node.node_id, 0) == 1:
-                if node.parent and node.parent.Q is not None:
-                    node.parent.Q = max(0, node.parent.Q + C_c - node.parent.cost_budget_gamma)
-                history['node_costs'][node.node_id].append(C_c)
-                total_job_cost += C_c
+            if node.node_id in offload_decisions:
+                history['node_offload_decisions'][node.node_id].append(1 if offload_decisions[node.node_id] != node.K_parents else 0)
             else:
-                history['node_costs'][node.node_id].append(0)
-            history['node_offload_decisions'][node.node_id].append(offload_decisions.get(node.node_id, 0))
+                history['node_offload_decisions'][node.node_id].append(0)
 
+        # total cost only when a hop happens
+        # Apply cost to each visited transition (node -> chosen parent)
+        for t_idx in range(len(visited_path) - 1):
+            parent = visited_path[t_idx + 1]
+            if parent.Q is not None:
+                parent.Q = max(0, parent.Q + C_c - parent.cost_budget_gamma)
+            total_job_cost += C_c
+
+        # Record per-node queues and costs
+        for node in system.get_non_cloud_nodes():
+            history['node_costs'][node.node_id].append(total_job_cost)  # keep as in original (per-job total)
         for node in system.nodes.values():
             if node.Q is not None:
                 history['node_queues'][node.node_id].append(node.Q)
 
         history['errors'].append(job_error)
         history['costs_total'].append(total_job_cost)
-        history['feedback_received'].append(int(feedback_received))
+        history['feedback_received'].append(1 if feedback_received else 0)
         history['execution_layer'].append(executed_at_node.level)
 
     return history
 
 
-def loss_recursive_exp(node, v_param, system, use_variance_reduction, if_feedback):
-    # exp loss (do not use experts), for its child node
-    parent = node.parent
-    if use_variance_reduction is True:
-        residual_b = (node.b_true - node.b_hat) / node.p_to_cloud * if_feedback
-        residual_C = (node.C_true - node.C_hat) / node.p_to_cloud * if_feedback
-        if parent.level == system.num_layers - 1: # end of the recurse, parent is the cloud
-            node.exp_loss = (v_param * (1 - node.p_offload) * (residual_b + node.b_hat) +
-                             node.p_offload * parent.Q * (residual_C + node.C_hat))
-        else:
-            node.exp_loss = (v_param * (1 - node.p_offload) * (residual_b + node.b_hat) +
-                             node.p_offload * parent.Q * (residual_C + node.C_hat) + parent.exp_loss)
-    else:  # without VR
-        if parent.level == system.num_layers - 1: # end of the recurse, parent is the cloud
-            node.exp_loss = (v_param * (1 - node.p_offload) * node.b_true
-                             + node.p_offload * parent.Q * node.C_true)
-        else:
-            node.exp_loss = (v_param * (1 - node.p_offload) * node.b_true
-                             + node.p_offload * parent.Q * node.C_true + parent.exp_loss)
+def loss_recursive_exp_multi(node, v_param, system, all_node_action_probs, use_variance_reduction, if_feedback):
+    """
+    Expected loss at node under the *current stochastic policy* (not conditioned on any expert).
+    With multiple parents, the offload term uses the expected parent Q and expected parent exp_loss
+    under the conditional distribution over parents given offload.
+    """
+    K = node.K_parents
+    # action distribution at this node (length K+1)
+    p = all_node_action_probs[node.node_id]
+    p_offload = float(np.sum(p[:-1]))
+    p_offload = max(p_offload, 1e-12)
+
+    # Conditional distribution over parents given offload
+    cond = p[:-1] / p_offload  # (K,)
+    exp_parent_Q = 0.0
+    exp_parent_loss = 0.0
+    for k in range(K):
+        parent = node.parents[k]
+        exp_parent_Q += cond[k] * parent.Q
+        exp_parent_loss += cond[k] * parent.exp_loss
+
+    if use_variance_reduction:
+        residual_b = (node.b_true - node.b_hat) / (node.p_to_cloud + 1e-12) * if_feedback
+        residual_C = (node.C_true - node.C_hat) / (node.p_to_cloud + 1e-12) * if_feedback
+        node.exp_loss = (
+            v_param * (1 - p_offload) * (residual_b + node.b_hat)
+            + p_offload * (exp_parent_Q * (residual_C + node.C_hat) + exp_parent_loss)
+        )
+    else:
+        node.exp_loss = (
+            v_param * (1 - p_offload) * node.b_true
+            + p_offload * (exp_parent_Q * node.C_true + exp_parent_loss)
+        )
 
 
-def loss_recursive_actual(node, v_param, system, a, expert_thresholds, use_variance_reduction, if_feedback):
-    # actual loss for each expert
-    o_hat_a = 1 if expert_thresholds[a] > node.confidence else 0
-    parent = node.parent
-    if use_variance_reduction is True:
-        residual_b = (node.b_true - node.b_hat) / node.p_to_cloud * if_feedback
-        residual_C = (node.C_true - node.C_hat) / node.p_to_cloud * if_feedback
-        if parent.level == system.num_layers - 1: # end of the recurse, parent is the cloud
-            node.actual_loss[a] = (v_param * (1 - o_hat_a) * (residual_b + node.b_hat) +
-                             o_hat_a * parent.Q * (residual_C + node.C_hat))
-        else:
-            node.actual_loss[a] = (v_param * (1 - o_hat_a) * (residual_b + node.b_hat) +
-                             o_hat_a * parent.Q * (residual_C + node.C_hat) + parent.exp_loss)
-    else:  # without VR
-        if parent.level == system.num_layers - 1: # end of the recurse, parent is the cloud
-            node.actual_loss[a] = (v_param * (1 - o_hat_a) * node.b_true
-                             + o_hat_a * parent.Q * node.C_true)
-        else:
-            node.actual_loss[a] = (v_param * (1 - o_hat_a) * node.b_true
-                             + o_hat_a * parent.Q * node.C_true + parent.exp_loss)
+def loss_recursive_actual_multi(node, v_param, system, k, a, expert_thresholds,
+                               all_node_action_probs, use_variance_reduction, if_feedback):
+    """
+    Loss for expert (k,a): offload to parent k iff theta_a > confidence, else stay.
+    """
+    o_hat = 1 if expert_thresholds[a] > node.confidence else 0
+    parent = node.parents[k]  # specific parent for this expert group
 
-
+    if use_variance_reduction:
+        residual_b = (node.b_true - node.b_hat) / (node.p_to_cloud + 1e-12) * if_feedback
+        residual_C = (node.C_true - node.C_hat) / (node.p_to_cloud + 1e-12) * if_feedback
+        node.actual_loss[k, a] = (
+            v_param * (1 - o_hat) * (residual_b + node.b_hat)
+            + o_hat * (parent.Q * (residual_C + node.C_hat)
+                       + parent.exp_loss)
+        )
+    else:
+        node.actual_loss[k, a] = (
+            v_param * (1 - o_hat) * node.b_true
+            + o_hat * ((parent.Q if parent.Q is not None else 0.0) * node.C_true
+                       + parent.exp_loss)
+        )
 
 
 def aggregate_results(all_histories):
@@ -717,12 +796,12 @@ if __name__ == '__main__':
         for trial in range(NUM_TRIALS):
             print(f"Trial {trial + 1}/{NUM_TRIALS}")
 
-            system = HierarchicalSystem(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'])
+            system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
             res_no = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM,
                                       use_variance_reduction=False, initial_error_rates=Avg_err)
             all_no_vr.append(res_no)
 
-            system = HierarchicalSystem(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'])
+            system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
             res_vr = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM,
                                       use_variance_reduction=True, initial_error_rates=Avg_err)
             all_vr.append(res_vr)
@@ -730,7 +809,7 @@ if __name__ == '__main__':
         agg_no = aggregate_results(all_no_vr)
         agg_vr = aggregate_results(all_vr)
 
-        system = HierarchicalSystem(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'])
+        system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
         plot_results(agg_no, agg_vr, all_no_vr, all_vr, system, NUM_JOBS, prefix=name)
         plot_layer0_loss(all_no_vr, all_vr, system, prefix=name)
 
