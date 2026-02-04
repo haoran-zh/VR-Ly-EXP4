@@ -55,6 +55,55 @@ def estimate_model_perforance(data):
     return model_avg_performance, model_err_performance
 
 
+def model_perforance_GT(data):
+    """
+    Estimates model performance based on a random sample of data.
+    Ensures ALL task categories exist in the output, defaulting to 0.5 if not sampled.
+    """
+    full_data = data['full_data']
+    total_sample_num = data['total_samples']
+    all_indices = list(range(total_sample_num))
+    model_num = len(data['available_models'])
+    all_categories = data['task_types']  # Get list of all possible task types
+
+    # Randomly select 500 samples
+    sample_num = total_sample_num
+    sampled_indices = random.sample(all_indices, sample_num)
+
+    # Initialize accumulators for ALL categories to ensure coverage
+    # We use temporary dictionaries to hold sums and counts
+    category_sums = {cat: np.zeros(model_num) for cat in all_categories}
+    category_counts = {cat: 0 for cat in all_categories}
+
+    # Process the sampled data
+    for sample_idx in sampled_indices:
+        query = full_data[sample_idx]
+        category = query['category']
+        results = np.array(query['results'])
+
+        # Accumulate data if the category is recognized
+        if category in category_sums:
+            category_sums[category] += results
+            category_counts[category] += 1
+
+    model_avg_performance = {}
+    model_err_performance = {}
+
+    # Calculate final averages with fallback logic
+    for cat in all_categories:
+        if category_counts[cat] > 0:
+            # If we have samples, calculate the real average
+            avg_acc = category_sums[cat] / category_counts[cat]
+        else:
+            # If we missed this category in sampling, default to 0.5
+            avg_acc = np.ones(model_num) * 0.5
+
+        model_avg_performance[cat] = avg_acc
+        model_err_performance[cat] = 1.0 - avg_acc
+
+    return model_avg_performance, model_err_performance
+
+
 def convert_offloadingCost(data, sample_idx, scale):
     full_data = data['full_data']
     return full_data[sample_idx]['length'] * scale

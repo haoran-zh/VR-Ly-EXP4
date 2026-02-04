@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from utilities.model_performance import estimate_model_perforance, convert_offloadingCost, estimate_offloadingCost, \
+from utilities.model_performance import model_perforance_GT, estimate_model_perforance, convert_offloadingCost, estimate_offloadingCost, \
     lowest_avg_error
 import pickle as pkl
 import random
@@ -14,6 +14,9 @@ with open(FILENAME, 'rb') as f:
 Avg_acc, Avg_err = estimate_model_perforance(data)
 ERROR_RATES = Avg_err
 
+GT_acc, GT_err = model_perforance_GT(data)
+ERROR_RATES_GT = GT_err
+
 OffloadCost_SCALE = 0.001
 avg_offloadCost = estimate_offloadingCost(data, OffloadCost_SCALE)
 
@@ -25,6 +28,41 @@ MODEL_SIZES = np.array([0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0])
 MODEL_ONLOADING_COSTS = MODEL_SIZES
 ONLOADING_EPOCH_LENGTH = 500
 V_ONLOAD = 700
+BEST_MODEL_IDX=7
+
+# error rate if all jobs were executed by a specific model
+def compute_baseline_error_rate(model_idx=BEST_MODEL_IDX):
+    """
+    Compute the average error rate if all jobs were executed by a specific model.
+
+    Args:
+        model_idx: Index of the model (default: 7 = Qwen2-72B)
+
+    Returns:
+        overall_error: Average error rate across all jobs
+        per_task_error: Dict of error rates per task type
+    """
+    total_errors = 0
+    total_jobs = 0
+    per_task_errors = {t: 0 for t in TASK_NAMES}
+    per_task_counts = {t: 0 for t in TASK_NAMES}
+
+    for idx in range(TOTAL_JOBS):
+        task_type = data['full_data'][idx]['category']
+        # result = 1 means correct, 0 means incorrect
+        result = data['full_data'][idx]['results'][model_idx]
+        error = 1 - result  # error = 1 if incorrect, 0 if correct
+
+        total_errors += error
+        total_jobs += 1
+        per_task_errors[task_type] += error
+        per_task_counts[task_type] += 1
+
+    overall_error = total_errors / total_jobs
+    per_task_error = {t: per_task_errors[t] / per_task_counts[t] if per_task_counts[t] > 0 else 0
+                      for t in TASK_NAMES}
+
+    return overall_error, per_task_error
 
 
 def get_system_configs():
@@ -69,7 +107,7 @@ def get_system_configs():
 class HierarchicalNode:
     def __init__(self, node_id, level, memory_capacity, available_models, cost_budget_gamma):
         self.node_id = node_id
-        self.level = level
+        self.level = level  # layer level
         self.memory_capacity = memory_capacity
         self.available_models = available_models
         self.cost_budget_gamma = cost_budget_gamma
@@ -108,16 +146,16 @@ class HierarchicalSystem:
                     cost_budget_gamma=config.get('gamma', 0)
                 )
                 if layer_idx > 0:
-                    node.Q = 0.0
+                    node.Q = 0.0  # initialize the queue, except the initial layer
                 self.nodes[node_id] = node
                 current_layer_nodes.append(node)
-                if layer_idx < self.num_layers - 1 and layer_nodes:
+                if layer_idx < self.num_layers - 1 and layer_nodes:  # if layer_nodes is empty, then it's the initial layer
                     parent_idx = i % len(layer_nodes)
                     layer_nodes[parent_idx].add_child(node)
             layer_nodes = current_layer_nodes
 
     def get_leaf_nodes(self):
-        return [n for n in self.nodes.values() if n.level == 0]
+        return [n for n in self.nodes.values() if n.level == 0]  # initial layer
 
     def get_cloud_node(self):
         return [n for n in self.nodes.values() if n.level == self.num_layers - 1][0]
@@ -196,8 +234,8 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
 
     # Initialize nodes
     for node in system.get_non_cloud_nodes():
-        node.S = np.zeros((NUM_TASK_TYPES, num_experts))
-        node.w = np.ones((NUM_TASK_TYPES, num_experts)) / num_experts
+        node.S = np.zeros((NUM_TASK_TYPES, num_experts))  # accumulated loss
+        node.w = np.ones((NUM_TASK_TYPES, num_experts)) / num_experts  # weights for each expert
         if enable_onloading and len(node.available_models) > 0:
             node.onloaded_models = initialize_onloaded_models(node.memory_capacity, node.available_models)
         else:
@@ -208,11 +246,12 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
     node_offload_probs = {n.node_id: {t: 0.5 for t in TASK_NAMES} for n in system.get_non_cloud_nodes()}
     epoch_offload_sum = {n.node_id: {t: 0.0 for t in TASK_NAMES} for n in system.get_non_cloud_nodes()}
     epoch_task_counts = {n.node_id: {t: 0 for t in TASK_NAMES} for n in system.get_non_cloud_nodes()}
+    # question: what's the difference between node_task_counts and epoch_task_counts
 
-    # VR warmup
+    # Variance reduction control variants setup
     if use_variance_reduction:
         avg_cost_estimate = {t: avg_offloadCost[t] for t in TASK_NAMES}
-        cost_obs_count = {t: 2000 for t in TASK_NAMES}
+        cost_obs_count = {t: 2000 for t in TASK_NAMES}  # how many samples we use to estimate the avg cost
 
     history = {
         'errors': [], 'costs_total': [],
@@ -230,7 +269,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
             print(f"  Job {j}: err={np.mean(history['errors'][-1000:]):.3f}, "
                   f"fb={np.mean(history['feedback_received'][-1000:]):.3f}")
 
-        # Periodic onloading
+        # Onloading part
         if enable_onloading and j > 0 and j % ONLOADING_EPOCH_LENGTH == 0:
             total_onload_cost = 0
             for node in system.get_non_cloud_nodes():
@@ -257,17 +296,14 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                 epoch_task_counts[node.node_id] = {t: 0 for t in TASK_NAMES}
         else:
             history['onload_costs'].append(0)
+        # TODO: I just skipped reviewing onloading part, I need to come back later.
 
         # Select job
-        idx = random.randint(0, TOTAL_JOBS - 1)
+        idx = random.randint(0, TOTAL_JOBS - 1)  # decide job idx from all data
         task_type = data['full_data'][idx]['category']
         task_type_idx = TASK_NAMES.index(task_type)
         task_counts[task_type] += 1
 
-        # ================================================================
-        # KEY FIX: Build FULL path from leaf to cloud BEFORE decisions
-        # Compute error estimates and offload probabilities for ALL nodes
-        # ================================================================
         leaf_nodes = system.get_leaf_nodes()
         start_node = random.choice(leaf_nodes)
 
@@ -287,17 +323,18 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
 
         for node in full_path[:-1]:  # Exclude cloud
             # Error estimate
-            if len(node.onloaded_models) == 0:
-                err_est, best_model = 1.0, None
+            if len(node.onloaded_models) == 0:  # if we don't have available models.
+                # TODO: we will add Video datasets soon, in this part, need to modify.
+                err_exp, best_model = 1.0, None
             else:
-                err_est, best_model = lowest_avg_error(estimated_error_rates[task_type], node.onloaded_models)
-                if err_est is None:
-                    err_est = 1.0
-            all_node_err_estimates[node.node_id] = err_est
+                err_exp, best_model = lowest_avg_error(ERROR_RATES_GT[task_type], node.onloaded_models)
+                if err_exp is None:
+                    err_exp = 1.0
+            all_node_err_estimates[node.node_id] = err_exp
             all_node_best_models[node.node_id] = best_model
 
             # Confidence (same for all nodes)
-            confidence = np.clip(np.random.normal(1.0 - err_est, 0.1), 0, 1)
+            confidence = np.clip(np.random.normal(1.0 - err_exp, 0.1), 0, 1)
             all_node_confidences[node.node_id] = confidence
 
             # Offload probability from current weights
@@ -314,12 +351,13 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         executed_at_node = None
 
         while current_node is not None:
-            if current_node.level == system.num_layers - 1:
+            if current_node.level == system.num_layers - 1:  # reach the cloud (if the system only has 1 layer)
                 executed_at_node = current_node
                 break
 
             node_task_counts[current_node.node_id][task_type] += 1
             epoch_task_counts[current_node.node_id][task_type] += 1
+            # pseudoTODO: here the offload_sum is the prob sum (seems okay)
             epoch_offload_sum[current_node.node_id][task_type] += all_node_offload_probs[current_node.node_id]
 
             # Make decision
@@ -338,8 +376,6 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                     executed_at_node = system.get_cloud_node()
                     break
 
-        if executed_at_node is None:
-            executed_at_node = system.get_cloud_node()
 
         # Determine outcome
         if executed_at_node.level == system.num_layers - 1:
@@ -354,7 +390,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         # ================================================================
         # Compute node-specific probability to cloud using FULL path
         # ================================================================
-        node_prob_to_cloud = {}
+        node_prob_to_cloud = {}  # we only need this prob when the task offloads to the cloud
         for path_idx, node in enumerate(full_path[:-1]):  # Exclude cloud
             prob_to_cloud = 1.0
             for i in range(path_idx, len(full_path) - 1):
@@ -362,10 +398,12 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
             node_prob_to_cloud[node.node_id] = max(prob_to_cloud, 1e-9)
 
         # IPS error rate update (only with feedback)
+        # this is the update for control variants
         if feedback_received:
             joint_prob = node_prob_to_cloud[full_path[0].node_id]
             ips_weight = min(1.0 / (joint_prob + 1e-9), MAX_IPS_WEIGHT)
 
+            # TODO: this seems wrong. what is the use of estimated_error_rates?
             for node in full_path[:-1]:
                 if len(node.onloaded_models) == 0:
                     continue
@@ -390,10 +428,10 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         # ================================================================
         if use_variance_reduction:
             nodes_to_update = full_path[:-1]  # All except cloud
-        elif feedback_received:
+        elif feedback_received:  # only without VR can reach this option
             nodes_to_update = visited_path[:-1] if visited_path[-1].level == system.num_layers - 1 else visited_path
         else:
-            nodes_to_update = []
+            nodes_to_update = []  # without VR, no node to update if no feedback
 
         for node in nodes_to_update:
             path_idx = full_path.index(node)
@@ -404,6 +442,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
 
             # Baseline error estimate for this node (for VR)
             b_hat = all_node_err_estimates[node.node_id]
+            # TODO: b_hat (or all_node_err_estimates) does not update properly.
 
             for a in range(num_experts):
                 o_hat_a = 1 if expert_thresholds[a] > all_node_confidences[node.node_id] else 0
@@ -426,7 +465,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                 else:
                     # ===== OFFLOAD: Compute recursively using FULL path =====
                     parent_idx = path_idx + 1
-                    if parent_idx >= len(full_path):
+                    if path_idx >= (len(full_path)-1):
                         L_hat[a] = 0.0
                         continue
 
@@ -434,7 +473,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                     Q_parent = parent.Q if parent.Q is not None else 0.0
 
                     if parent.level == system.num_layers - 1:
-                        # Parent is CLOUD
+                        # Parent is CLOUD, node is not the cloud
                         if use_variance_reduction:
                             C_hat = avg_cost_estimate[task_type]
                             if feedback_received:
@@ -527,7 +566,7 @@ def compute_offload_loss_recursive(full_path, node_idx, offload_probs, err_estim
 
     if parent.level == system.num_layers - 1:
         return Q_parent * C_hat
-
+    # TODO: check the recursive loss functions carefully
     p_parent = offload_probs.get(parent.node_id, 0.5)
     b_parent = err_estimates.get(parent.node_id, 1.0)
 
@@ -590,22 +629,24 @@ def plot_results(agg_no_vr, agg_vr, all_no_vr, all_vr, system, num_jobs, prefix=
     """Plot main performance results"""
     jobs = np.arange(num_jobs)
     fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    fig.suptitle(f'{system.num_layers}-Layer Performance ({system.nodes_per_layer})', fontsize=16)
+    fig.suptitle(f'{system.num_layers}-Layer Performance ({system.nodes_per_layer})', fontsize=24)
 
     # Error rate
     axes[0, 0].plot(jobs, np.cumsum(agg_no_vr['errors_mean']) / (jobs + 1), label='No VR')
     axes[0, 0].plot(jobs, np.cumsum(agg_vr['errors_mean']) / (jobs + 1), '--', label='With VR')
-    axes[0, 0].set_ylabel('Avg Error Rate')
-    axes[0, 0].set_xlabel('Jobs')
-    axes[0, 0].legend();
+    axes[0, 0].set_ylabel('Avg Error Rate', fontsize=24)
+    axes[0, 0].set_xlabel('Jobs', fontsize=24)
+    axes[0, 0].tick_params(axis='both', which='major', labelsize=14)
+    axes[0, 0].legend(fontsize=24);
     axes[0, 0].grid(True)
 
     # Feedback rate
     axes[0, 1].plot(jobs, np.cumsum(agg_no_vr['feedback_received_mean']) / (jobs + 1), label='No VR')
     axes[0, 1].plot(jobs, np.cumsum(agg_vr['feedback_received_mean']) / (jobs + 1), '--', label='With VR')
-    axes[0, 1].set_ylabel('Feedback Rate')
-    axes[0, 1].set_xlabel('Jobs')
-    axes[0, 1].legend();
+    axes[0, 1].set_ylabel('Feedback Rate', fontsize=24)
+    axes[0, 1].set_xlabel('Jobs', fontsize=24)
+    axes[0, 1].tick_params(axis='both', which='major', labelsize=14)
+    axes[0, 1].legend(fontsize=24);
     axes[0, 1].grid(True)
 
     # # Total cost
@@ -621,9 +662,10 @@ def plot_results(agg_no_vr, agg_vr, all_no_vr, all_vr, system, num_jobs, prefix=
     # Per-node costs
     for nid in list(agg_no_vr['node_costs'].keys())[:6]:
         axes[1, 0].plot(jobs, np.cumsum(agg_no_vr['node_costs'][nid]['mean']) / (jobs + 1), label=nid, alpha=0.7)
-    axes[1, 0].set_ylabel('Avg Cost/Node')
-    axes[1, 0].set_xlabel('Jobs')
-    axes[1, 0].legend(fontsize=8);
+    axes[1, 0].set_ylabel('Avg Cost/Node', fontsize=24)
+    axes[1, 0].set_xlabel('Jobs', fontsize=24)
+    axes[1, 0].tick_params(axis='both', which='major', labelsize=14)
+    axes[1, 0].legend(fontsize=24);
     axes[1, 0].grid(True)
 
     # Queue sizes
@@ -651,14 +693,15 @@ def plot_results(agg_no_vr, agg_vr, all_no_vr, all_vr, system, num_jobs, prefix=
     axes[1, 1].bar(x + 0.175, exec_vr, 0.35, label='With VR')
     axes[1, 1].set_xticks(x)
     axes[1, 1].set_xticklabels([f'L{i}' for i in range(system.num_layers)])
-    axes[1, 1].set_ylabel('Jobs Executed')
-    axes[1, 1].set_title('Execution Distribution')
-    axes[1, 1].legend();
+    axes[1, 1].set_ylabel('Jobs Executed', fontsize=24)
+    axes[1, 1].set_title('Execution Distribution', fontsize=24)
+    axes[1, 1].legend(fontsize=24);
+    axes[1, 1].tick_params(axis='both', which='major', labelsize=14)
     axes[1, 1].grid(True, axis='y')
 
     plt.tight_layout()
-    plt.savefig(f'{prefix}_performance.png', dpi=300, bbox_inches='tight')
-    print(f"Saved {prefix}_performance.png")
+    plt.savefig(f'{prefix}_performance_small.png', dpi=300, bbox_inches='tight')
+    print(f"Saved {prefix}_performance_small.png")
     plt.close()
 
 
@@ -762,8 +805,16 @@ if __name__ == '__main__':
     LEARNING_RATE = 0.01
     V_PARAM = 500
 
+    baseline_error, per_task_baseline = compute_baseline_error_rate(BEST_MODEL_IDX)
+
+    print("=" * 60)
+    print("BASELINE PERFORMANCE (Qwen2-72B on all jobs)")
+    print("=" * 60)
+    print(f"Overall Error Rate: {baseline_error:.4f}")
+
     configs = get_system_configs()
-    to_run = ['3layer_1-1-1', '3layer_4-2-1', '4layer_1-1-1-1', '4layer_8-4-2-1']
+    to_run = ['3layer_1-1-1']
+    # , '3layer_4-2-1', '4layer_1-1-1-1', '4layer_8-4-2-1'
 
     for name in to_run:
         cfg = configs[name]
