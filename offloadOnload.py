@@ -224,10 +224,6 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
     """
     expert_thresholds = np.linspace(0, 1, num_experts)
 
-    if initial_error_rates is None:
-        estimated_error_rates = copy.deepcopy(ERROR_RATES)
-    else:
-        estimated_error_rates = copy.deepcopy(initial_error_rates)
 
     ERROR_LEARNING_RATE = 0.05
     MAX_IPS_WEIGHT = 20.0
@@ -246,6 +242,8 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
     node_offload_probs = {n.node_id: {t: 0.5 for t in TASK_NAMES} for n in system.get_non_cloud_nodes()}
     epoch_offload_sum = {n.node_id: {t: 0.0 for t in TASK_NAMES} for n in system.get_non_cloud_nodes()}
     epoch_task_counts = {n.node_id: {t: 0 for t in TASK_NAMES} for n in system.get_non_cloud_nodes()}
+
+    estimated_error_rates_per_node = {n.node_id: copy.deepcopy(initial_error_rates) for n in system.get_non_cloud_nodes()}
     # question: what's the difference between node_task_counts and epoch_task_counts
 
     # Variance reduction control variants setup
@@ -286,7 +284,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                 new_models, cost = enhanced_greedy_onloading(
                     V_ONLOAD, node.onloaded_models, node.memory_capacity,
                     MODEL_SIZES[node.available_models], MODEL_ONLOADING_COSTS[node.available_models],
-                    estimated_error_rates, local_dist, node.available_models, TASK_NAMES
+                    estimated_error_rates_per_node[node.node_id], local_dist, node.available_models, TASK_NAMES
                 )
                 node.onloaded_models = new_models
                 total_onload_cost += cost
@@ -316,7 +314,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         # full_path = [leaf, ..., cloud]
 
         # Pre-compute info for ALL nodes on path (except cloud)
-        all_node_err_estimates = {}
+
         all_node_best_models = {}
         all_node_confidences = {}
         all_node_offload_probs = {}
@@ -330,7 +328,6 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                 err_exp, best_model = lowest_avg_error(ERROR_RATES_GT[task_type], node.onloaded_models)
                 if err_exp is None:
                     err_exp = 1.0
-            all_node_err_estimates[node.node_id] = err_exp
             all_node_best_models[node.node_id] = best_model
 
             # Confidence (same for all nodes)
@@ -400,10 +397,9 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         # IPS error rate update (only with feedback)
         # this is the update for control variants
         if feedback_received:
-            joint_prob = node_prob_to_cloud[full_path[0].node_id]
+            joint_prob = node_prob_to_cloud[full_path[0].node_id]  # the whole path prob
             ips_weight = min(1.0 / (joint_prob + 1e-9), MAX_IPS_WEIGHT)
 
-            # TODO: this seems wrong. what is the use of estimated_error_rates?
             for node in full_path[:-1]:
                 if len(node.onloaded_models) == 0:
                     continue
@@ -411,9 +407,9 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                 if best_model is None:
                     continue
                 b_true = int(1 - data['full_data'][idx]['results'][best_model])
-                old_est = estimated_error_rates[task_type][best_model]
+                old_est = estimated_error_rates_per_node[node.node_id][task_type][best_model]
                 new_est = (1 - ERROR_LEARNING_RATE) * old_est + ERROR_LEARNING_RATE * (b_true * ips_weight)
-                estimated_error_rates[task_type][best_model] = np.clip(new_est, 0.0, 1.0)
+                estimated_error_rates_per_node[node.node_id][task_type][best_model] = np.clip(new_est, 0.0, 1.0)
 
         # Update cost estimate for VR
         if use_variance_reduction and feedback_received:
@@ -441,8 +437,8 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
             p_node_to_cloud = node_prob_to_cloud[node.node_id]
 
             # Baseline error estimate for this node (for VR)
-            b_hat = all_node_err_estimates[node.node_id]
-            # TODO: b_hat (or all_node_err_estimates) does not update properly.
+            best_model = all_node_best_models.get(node.node_id)
+            b_hat = estimated_error_rates_per_node[node.node_id][task_type][best_model]
 
             for a in range(num_experts):
                 o_hat_a = 1 if expert_thresholds[a] > all_node_confidences[node.node_id] else 0
@@ -490,7 +486,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                         if use_variance_reduction:
                             C_hat = avg_cost_estimate[task_type]
                             L_offload_hat = compute_offload_loss_recursive(
-                                full_path, path_idx, all_node_offload_probs, all_node_err_estimates,
+                                full_path, path_idx, all_node_offload_probs, estimated_error_rates_per_node,
                                 C_hat, v_param, system
                             )
                             if feedback_received:
@@ -564,11 +560,12 @@ def compute_offload_loss_recursive(full_path, node_idx, offload_probs, err_estim
     parent = full_path[parent_idx]
     Q_parent = parent.Q if parent.Q is not None else 0.0
 
-    if parent.level == system.num_layers - 1:
+    if parent.level == system.num_layers - 1:  # if parent is the cloud
         return Q_parent * C_hat
     # TODO: check the recursive loss functions carefully
     p_parent = offload_probs.get(parent.node_id, 0.5)
-    b_parent = err_estimates.get(parent.node_id, 1.0)
+    b_parent = err_estimates.get(parent.node_id, None)
+
 
     L_offload_parent = compute_offload_loss_recursive(full_path, parent_idx, offload_probs, err_estimates, C_hat,
                                                       v_param, system)
