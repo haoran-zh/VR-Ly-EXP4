@@ -117,6 +117,16 @@ class HierarchicalNode:
         self.Q = None
         self.w = None
         self.S = None
+        # temp below
+        self.b_true = None
+        self.b_hat = None
+        self.C_true = None
+        self.C_hat = None
+        self.exp_loss = None
+        self.actual_loss = None
+        self.p_to_cloud = None
+        self.p_offload = None
+        self.confidence = None
 
     def add_child(self, child_node):
         self.children.append(child_node)
@@ -338,6 +348,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
             offload_experts = expert_thresholds > confidence
             prob = np.clip(np.sum(node.w[task_type_idx, offload_experts]), 1e-5, 1 - 1e-5)
             all_node_offload_probs[node.node_id] = prob
+            node.p_offload = prob
 
         # ================================================================
         # Now do the actual traversal (decisions)
@@ -412,7 +423,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                 estimated_error_rates_per_node[node.node_id][task_type][best_model] = np.clip(new_est, 0.0, 1.0)
 
         # Update cost estimate for VR
-        if use_variance_reduction and feedback_received:
+        if use_variance_reduction:
             count = cost_obs_count[task_type]
             avg_cost_estimate[task_type] = (avg_cost_estimate[task_type] * count + C_c) / (count + 1)
             cost_obs_count[task_type] += 1
@@ -423,98 +434,53 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         # Standard: Only update visited nodes when feedback received
         # ================================================================
         if use_variance_reduction:
-            nodes_to_update = full_path[:-1]  # All except cloud
+            nodes_to_update = full_path[-2::-1]  # All except cloud
         elif feedback_received:  # only without VR can reach this option
-            nodes_to_update = visited_path[:-1] if visited_path[-1].level == system.num_layers - 1 else visited_path
-        else:
+            nodes_to_update = full_path[-2::-1]
+        else:  # if no feedback (without VR)
             nodes_to_update = []  # without VR, no node to update if no feedback
+        # nodes_to_update is in reverse order, from parent to child
 
         for node in nodes_to_update:
-            path_idx = full_path.index(node)
-            L_hat = np.zeros(num_experts)
-
+            # path_idx = full_path.index(node)  # 5->4->3->2->1
+            node.exp_loss = None
+            node.actual_loss = np.zeros(num_experts)
             # This node's probability to cloud
-            p_node_to_cloud = node_prob_to_cloud[node.node_id]
-
+            node.p_to_cloud = node_prob_to_cloud[node.node_id]
             # Baseline error estimate for this node (for VR)
             best_model = all_node_best_models.get(node.node_id)
-            b_hat = estimated_error_rates_per_node[node.node_id][task_type][best_model]
+            node.b_hat = estimated_error_rates_per_node[node.node_id][task_type][best_model]
+            node.b_true = int(1 - data['full_data'][idx]['results'][best_model]) if feedback_received else node.b_hat
+            node.confidence = all_node_confidences[node.node_id]
+            node.C_true = C_c
+            node.C_hat = avg_cost_estimate[task_type] if use_variance_reduction else C_c
 
             for a in range(num_experts):
-                o_hat_a = 1 if expert_thresholds[a] > all_node_confidences[node.node_id] else 0
-
-                if o_hat_a == 0:
-                    # ===== LOCAL EXECUTION: L = V * b =====
-                    if use_variance_reduction:
-                        if feedback_received:
-                            best_model = all_node_best_models.get(node.node_id)
-                            b_true = int(1 - data['full_data'][idx]['results'][best_model]) if best_model else 1
-                            residual = (b_true - b_hat) / p_node_to_cloud
-                            L_hat[a] = v_param * (residual + b_hat)
-                        else:
-                            L_hat[a] = v_param * b_hat
-                    elif feedback_received:
-                        best_model = all_node_best_models.get(node.node_id)
-                        b_true = int(1 - data['full_data'][idx]['results'][best_model]) if best_model else 1
-                        L_hat[a] = v_param * b_true / p_node_to_cloud
-
-                else:
-                    # ===== OFFLOAD: Compute recursively using FULL path =====
-                    parent_idx = path_idx + 1
-                    if path_idx >= (len(full_path)-1):
-                        L_hat[a] = 0.0
-                        continue
-
-                    parent = full_path[parent_idx]
-                    Q_parent = parent.Q if parent.Q is not None else 0.0
-
-                    if parent.level == system.num_layers - 1:
-                        # Parent is CLOUD, node is not the cloud
-                        if use_variance_reduction:
-                            C_hat = avg_cost_estimate[task_type]
-                            if feedback_received:
-                                residual = (C_c - C_hat) / p_node_to_cloud
-                                L_hat[a] = Q_parent * (residual + C_hat)
-                            else:
-                                L_hat[a] = Q_parent * C_hat
-                        elif feedback_received:
-                            L_hat[a] = Q_parent * C_c / p_node_to_cloud
-
-                    else:
-                        # Parent is INTERMEDIATE - need L_expected(parent)
-                        # Recursively compute using full_path
-                        if use_variance_reduction:
-                            C_hat = avg_cost_estimate[task_type]
-                            L_offload_hat = compute_offload_loss_recursive(
-                                full_path, path_idx, all_node_offload_probs, estimated_error_rates_per_node,
-                                C_hat, v_param, system
-                            )
-                            if feedback_received:
-                                L_offload_actual = compute_offload_loss_recursive_actual(
-                                    full_path, path_idx, all_node_offload_probs, all_node_best_models,
-                                    data, idx, C_c, v_param, system
-                                )
-                                residual = (L_offload_actual - L_offload_hat) / p_node_to_cloud
-                                L_hat[a] = residual + L_offload_hat
-                            else:
-                                L_hat[a] = L_offload_hat
-                        elif feedback_received:
-                            L_offload = compute_offload_loss_recursive_actual(
-                                full_path, path_idx, all_node_offload_probs, all_node_best_models,
-                                data, idx, C_c, v_param, system
-                            )
-                            L_hat[a] = L_offload / p_node_to_cloud
+                loss_recursive_exp(node, v_param, system, use_variance_reduction, if_feedback=feedback_received)
+                loss_recursive_actual(node, v_param, system, a, expert_thresholds, use_variance_reduction, if_feedback=feedback_received)
 
             # Update cumulative loss
-            node.S[task_type_idx] += L_hat
+            node.S[task_type_idx] += node.actual_loss
 
             # Record the total loss for this job (sum of L_hat across all experts)
-            history['node_loss_values'][node.node_id].append(np.sum(L_hat))
+            # feels useless
+            history['node_loss_values'][node.node_id].append(np.sum(node.actual_loss))
 
             # Normalize weights
             log_w = -learning_rate * node.S[task_type_idx]
-            log_w_shifted = log_w - np.max(log_w)
+            log_w_shifted = log_w - np.max(log_w)  # shifted w may be better
             node.w[task_type_idx] = np.exp(log_w_shifted) / np.sum(np.exp(log_w_shifted))
+        # set back to None for temp values
+        for node in nodes_to_update:
+            node.b_true = None
+            node.b_hat = None
+            node.C_true = None
+            node.C_hat = None
+            node.exp_loss = None
+            node.actual_loss = None
+            node.p_to_cloud = None
+            node.p_offload = None
+            node.confidence = None
 
         # For layer 0 (starting) node: record 0 if it wasn't updated (no-VR without feedback)
         start_node_id = start_node.node_id
@@ -551,51 +517,49 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
     return history
 
 
-def compute_offload_loss_recursive(full_path, node_idx, offload_probs, err_estimates, C_hat, v_param, system):
-    """Compute expected offload loss using baselines (for VR without feedback)"""
-    parent_idx = node_idx + 1
-    if parent_idx >= len(full_path):
-        return 0.0
-
-    parent = full_path[parent_idx]
-    Q_parent = parent.Q if parent.Q is not None else 0.0
-
-    if parent.level == system.num_layers - 1:  # if parent is the cloud
-        return Q_parent * C_hat
-    # TODO: check the recursive loss functions carefully
-    p_parent = offload_probs.get(parent.node_id, 0.5)
-    b_parent = err_estimates.get(parent.node_id, None)
-
-
-    L_offload_parent = compute_offload_loss_recursive(full_path, parent_idx, offload_probs, err_estimates, C_hat,
-                                                      v_param, system)
-    L_expected_parent = (1 - p_parent) * v_param * b_parent + p_parent * L_offload_parent
-
-    return Q_parent * C_hat + L_expected_parent
+def loss_recursive_exp(node, v_param, system, use_variance_reduction, if_feedback):
+    # exp loss (do not use experts), for its child node
+    parent = node.parent
+    if use_variance_reduction is True:
+        residual_b = (node.b_true - node.b_hat) / node.p_to_cloud * if_feedback
+        residual_C = (node.C_true - node.C_hat) / node.p_to_cloud * if_feedback
+        if parent.level == system.num_layers - 1: # end of the recurse, parent is the cloud
+            node.exp_loss = (v_param * (1 - node.p_offload) * (residual_b + node.b_hat) +
+                             node.p_offload * parent.Q * (residual_C + node.C_hat))
+        else:
+            node.exp_loss = (v_param * (1 - node.p_offload) * (residual_b + node.b_hat) +
+                             node.p_offload * parent.Q * (residual_C + node.C_hat) + parent.exp_loss)
+    else:  # without VR
+        if parent.level == system.num_layers - 1: # end of the recurse, parent is the cloud
+            node.exp_loss = (v_param * (1 - node.p_offload) * node.b_true
+                             + node.p_offload * parent.Q * node.C_true)
+        else:
+            node.exp_loss = (v_param * (1 - node.p_offload) * node.b_true
+                             + node.p_offload * parent.Q * node.C_true + parent.exp_loss)
 
 
-def compute_offload_loss_recursive_actual(full_path, node_idx, offload_probs, best_models, data, idx, C_c, v_param,
-                                          system):
-    """Compute actual offload loss using true values (for VR with feedback or standard)"""
-    parent_idx = node_idx + 1
-    if parent_idx >= len(full_path):
-        return 0.0
+def loss_recursive_actual(node, v_param, system, a, expert_thresholds, use_variance_reduction, if_feedback):
+    # actual loss for each expert
+    o_hat_a = 1 if expert_thresholds[a] > node.confidence else 0
+    parent = node.parent
+    if use_variance_reduction is True:
+        residual_b = (node.b_true - node.b_hat) / node.p_to_cloud * if_feedback
+        residual_C = (node.C_true - node.C_hat) / node.p_to_cloud * if_feedback
+        if parent.level == system.num_layers - 1: # end of the recurse, parent is the cloud
+            node.actual_loss[a] = (v_param * (1 - o_hat_a) * (residual_b + node.b_hat) +
+                             o_hat_a * parent.Q * (residual_C + node.C_hat))
+        else:
+            node.actual_loss[a] = (v_param * (1 - o_hat_a) * (residual_b + node.b_hat) +
+                             o_hat_a * parent.Q * (residual_C + node.C_hat) + parent.exp_loss)
+    else:  # without VR
+        if parent.level == system.num_layers - 1: # end of the recurse, parent is the cloud
+            node.actual_loss[a] = (v_param * (1 - o_hat_a) * node.b_true
+                             + o_hat_a * parent.Q * node.C_true)
+        else:
+            node.actual_loss[a] = (v_param * (1 - o_hat_a) * node.b_true
+                             + o_hat_a * parent.Q * node.C_true + parent.exp_loss)
 
-    parent = full_path[parent_idx]
-    Q_parent = parent.Q if parent.Q is not None else 0.0
 
-    if parent.level == system.num_layers - 1:
-        return Q_parent * C_c
-
-    p_parent = offload_probs.get(parent.node_id, 0.5)
-    best_model = best_models.get(parent.node_id)
-    b_parent = int(1 - data['full_data'][idx]['results'][best_model]) if best_model else 1
-
-    L_offload_parent = compute_offload_loss_recursive_actual(full_path, parent_idx, offload_probs, best_models, data,
-                                                             idx, C_c, v_param, system)
-    L_expected_parent = (1 - p_parent) * v_param * b_parent + p_parent * L_offload_parent
-
-    return Q_parent * C_c + L_expected_parent
 
 
 def aggregate_results(all_histories):
@@ -810,7 +774,7 @@ if __name__ == '__main__':
     print(f"Overall Error Rate: {baseline_error:.4f}")
 
     configs = get_system_configs()
-    to_run = ['3layer_1-1-1']
+    to_run = ['4layer_8-4-2-1']
     # , '3layer_4-2-1', '4layer_1-1-1-1', '4layer_8-4-2-1'
 
     for name in to_run:
