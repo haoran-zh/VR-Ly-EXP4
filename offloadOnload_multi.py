@@ -199,8 +199,8 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         K_n = len(getattr(node, 'parents', []))
         node.K_parents = K_n
         node.num_actions = K_n + 1  # K parents + stay
-        node.S = np.zeros((NUM_TASK_TYPES, node.num_actions, num_experts))  # cumulative loss per (k,a)
-        node.w = np.ones((NUM_TASK_TYPES, node.num_actions, num_experts)) / (node.num_actions * num_experts + 1e-12)
+        node.S = np.zeros((NUM_TASK_TYPES, K_n, num_experts))  # cumulative loss per (k,a)
+        node.w = np.ones((NUM_TASK_TYPES, K_n, num_experts)) / (node.num_actions * num_experts + 1e-12)
 
         if enable_onloading and len(node.available_models) > 0:
             node.onloaded_models = initialize_onloaded_models(node.memory_capacity, node.available_models)
@@ -238,11 +238,11 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
             return np.array([1.0])
         offload_mask = (expert_thresholds > z)  # shape (A,)
         # p_k: sum_a w_{k,a} 1{theta_a > z}
-        w_k_a = node.w[task_type_idx, :K, offload_mask]  # ignore the last prob (stay)
-        p_parents = np.sum(w_k_a, axis=0)  # (K+1,)
+        w_k_a = node.w[task_type_idx]  # ignore the last prob (stay)
+        p_parents = np.sum(w_k_a[:, offload_mask], axis=1)  # (K+1,)
         # p_stay: sum_{k,a} w_{k,a} 1{theta_a <= z}
-        p_stay = float(np.sum(node.w[task_type_idx, :, ~offload_mask]))
-        p = np.concatenate([p_parents, np.array([p_stay])], axis=0)
+        p_stay = float(np.sum(w_k_a[:, ~offload_mask]))
+        p = np.concatenate([p_parents, np.array([p_stay])])
         p = np.clip(p, 1e-12, None)
         p = p / np.sum(p)
         # exploration
@@ -431,7 +431,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         for node in nodes_to_update:
             K = node.K_parents  # how many parents
             node.exp_loss = None
-            node.actual_loss = np.zeros((node.num_actions, num_experts))
+            node.actual_loss = np.zeros((K, num_experts))
 
             node.p_to_cloud = P_cloud[node.node_id]
             best_model = all_node_best_models.get(node.node_id)
@@ -465,7 +465,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
             log_w -= np.max(log_w)
             w_flat = np.exp(log_w)
             w_flat /= np.sum(w_flat)
-            node.w[task_type_idx] = w_flat.reshape(K+1, num_experts)
+            node.w[task_type_idx] = w_flat.reshape(K, num_experts)
 
             # clear temp
         for node in nodes_to_update:
