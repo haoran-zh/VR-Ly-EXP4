@@ -78,18 +78,20 @@ def merge_two(d1: Dict[str, Any], d2: Dict[str, Any]) -> Dict[str, Any]:
             "idx": base.get("idx"),
             "uid": base.get("uid", None),
             "length": base.get("length", 0),
-            "results": [None] * len(merged_models),
+            "results": [0.0] * len(merged_models),
         }
 
         if r1 is not None:
             res1 = r1["results"]
             for model_name, j in idx1.items():
-                new_row["results"][midx[model_name]] = res1[j]
+                v = res1[j]
+                new_row["results"][midx[model_name]] = 0.0 if v is None else float(v)
 
         if r2 is not None:
             res2 = r2["results"]
             for model_name, j in idx2.items():
-                new_row["results"][midx[model_name]] = res2[j]
+                v = res2[j]
+                new_row["results"][midx[model_name]] = 0.0 if v is None else float(v)
 
         merged_full.append(new_row)
 

@@ -18,7 +18,7 @@ def estimate_model_perforance(data):
     all_categories = data['task_types']  # Get list of all possible task types
 
     # Randomly select 500 samples
-    sample_num = 2000
+    sample_num = 10000
     sampled_indices = random.sample(all_indices, sample_num)
 
     # Initialize accumulators for ALL categories to ensure coverage

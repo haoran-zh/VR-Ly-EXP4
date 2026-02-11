@@ -7,8 +7,14 @@ import pickle as pkl
 import random
 import copy
 
-# read dataset
-FILENAME = './data/ooo_dataset/ooo_dataset1.pkl'
+estimate_sample_num = 10000
+
+# remaining jobs: datasets (today), baselines (without loss design, Tuesday)
+# TODO: define onloading cost when using merged_dataset
+
+# read dataset FILENAME = './merged_ooo_dataset.pkl'
+# FILENAME = './data/ooo_dataset/ooo_dataset1.pkl'
+FILENAME = './merged_ooo_dataset.pkl'
 with open(FILENAME, 'rb') as f:
     data = pkl.load(f)
 
@@ -25,7 +31,9 @@ NUM_TASK_TYPES = len(data['task_types'])
 TASK_NAMES = data['task_types']
 TOTAL_JOBS = data['total_samples']
 
-MODEL_SIZES = np.array([0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0])
+MODEL_SIZES = np.array([0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0,
+                        0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0,
+                        0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0])
 MODEL_ONLOADING_COSTS = MODEL_SIZES
 ONLOADING_EPOCH_LENGTH = 500
 V_ONLOAD = 700
@@ -99,6 +107,16 @@ def get_system_configs():
             {'memory': 8, 'models': [0, 5, 6], 'gamma': 0},
             {'memory': 60, 'models': [0, 2, 5, 6], 'gamma': 0.4},
             {'memory': 85, 'models': [1, 3, 4, 7], 'gamma': 0.4},
+            {'gamma': 0.4},
+        ],
+    }
+    configs['5layer_16-8-4-2-1'] = {
+        'num_layers': 5, 'nodes_per_layer': [16, 8, 4, 2, 1],
+        'layer_configs': [
+            {'memory': 8, 'models': [0, 5, 6], 'gamma': 0},
+            {'memory': 30, 'models': [0, 2, 5, 6], 'gamma': 0.4},
+            {'memory': 65, 'models': [1, 3, 4, 7], 'gamma': 0.4},
+            {'memory': 85, 'models': [1, 3, 4, 7, 10, 12], 'gamma': 0.4},
             {'gamma': 0.4},
         ],
     }
@@ -186,7 +204,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
     """
     expert_thresholds = np.linspace(0, 1, num_experts)
 
-    ERROR_LEARNING_RATE = 0.05
+    ERROR_LEARNING_RATE = 1/estimate_sample_num
     MAX_IPS_WEIGHT = 20.0
 
     # -----------------------
@@ -219,7 +237,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
     # Variance reduction control variates
     if use_variance_reduction:
         avg_cost_estimate = {t: avg_offloadCost[t] for t in TASK_NAMES}
-        cost_obs_count = {t: 2000 for t in TASK_NAMES}
+        cost_obs_count = {t: estimate_sample_num for t in TASK_NAMES}
 
     history = {
         'errors': [], 'costs_total': [],
@@ -785,7 +803,7 @@ if __name__ == '__main__':
     print(f"Overall Error Rate: {baseline_error:.4f}")
 
     configs = get_system_configs()
-    to_run = ['4layer_8-4-2-1']
+    to_run = ['3layer_4-2-1']
     # , '3layer_4-2-1', '4layer_1-1-1-1', '4layer_8-4-2-1'
 
     for name in to_run:
@@ -798,12 +816,12 @@ if __name__ == '__main__':
 
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
             res_no = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM,
-                                      use_variance_reduction=False, initial_error_rates=Avg_err)
+                                      use_variance_reduction=False, initial_error_rates=Avg_err, exploration_gamma=0.1)
             all_no_vr.append(res_no)
 
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
             res_vr = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM,
-                                      use_variance_reduction=True, initial_error_rates=Avg_err)
+                                      use_variance_reduction=True, initial_error_rates=Avg_err, exploration_gamma=0.1)
             all_vr.append(res_vr)
 
         agg_no = aggregate_results(all_no_vr)
