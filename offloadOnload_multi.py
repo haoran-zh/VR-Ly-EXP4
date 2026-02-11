@@ -1,20 +1,16 @@
-import numpy as np
 import matplotlib.pyplot as plt
-from utilities.model_performance import model_perforance_GT, estimate_model_perforance, convert_offloadingCost, estimate_offloadingCost, \
-    lowest_avg_error
-from utilities.system import HierarchicalNode, HierarchicalSystem, HierarchicalSystemMulti
-import pickle as pkl
-import random
-import copy
+from utilities.system import HierarchicalSystemMulti
+import os
+from baselines import *
 
-estimate_sample_num = 10000
+estimate_sample_num = 2000
 
 # remaining jobs: datasets (today), baselines (without loss design, Tuesday)
 # TODO: define onloading cost when using merged_dataset
 
 # read dataset FILENAME = './merged_ooo_dataset.pkl'
 # FILENAME = './data/ooo_dataset/ooo_dataset1.pkl'
-FILENAME = './merged_ooo_dataset.pkl'
+FILENAME = './data/ooo_dataset/ooo_dataset1.pkl'
 with open(FILENAME, 'rb') as f:
     data = pkl.load(f)
 
@@ -38,6 +34,18 @@ MODEL_ONLOADING_COSTS = MODEL_SIZES
 ONLOADING_EPOCH_LENGTH = 500
 V_ONLOAD = 700
 BEST_MODEL_IDX=7
+
+
+def set_all_seeds(seed: int):
+    # Python hash seed (affects dict/set iteration in some cases)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    # Python RNG
+    random.seed(seed)
+
+    # NumPy RNG
+    np.random.seed(seed)
+
 
 # error rate if all jobs were executed by a specific model
 def compute_baseline_error_rate(model_idx=BEST_MODEL_IDX):
@@ -176,7 +184,7 @@ def enhanced_greedy_onloading(V, prev_models, memory, model_sizes, onload_costs,
 
 def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                      use_variance_reduction=False, enable_onloading=True, initial_error_rates=None,
-                     exploration_gamma=0.05):
+                     exploration_gamma=0.05, loss_mode='recursive'):
     """
     Multi-layer EXP4 (bandits with expert advice) for *multi-parent* offloading.
 
@@ -465,13 +473,15 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
             node.C_hat = (avg_cost_estimate[task_type] if use_variance_reduction else C_c)
 
             # Compute exp_loss once per node (uses node.p_offload + parent expectations)
-            loss_recursive_exp_multi(node, v_param, system, all_node_action_probs, use_variance_reduction, if_feedback=feedback_received)
+            loss_recursive_exp_multi(node, v_param, system, all_node_action_probs,
+                                     use_variance_reduction, if_feedback=feedback_received, loss_mode=loss_mode)
 
             # Compute per-expert losses (k,a)
             for k in range(K):
                 for a in range(num_experts):
                     loss_recursive_actual_multi(node, v_param, system, k, a, expert_thresholds,
-                                                all_node_action_probs, use_variance_reduction, if_feedback=feedback_received)
+                                                all_node_action_probs, use_variance_reduction,
+                                                if_feedback=feedback_received, loss_mode=loss_mode)
 
             # Accumulate loss and update weights (flatten over (k,a))
             node.S[task_type_idx] += node.actual_loss
@@ -532,12 +542,16 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
     return history
 
 
-def loss_recursive_exp_multi(node, v_param, system, all_node_action_probs, use_variance_reduction, if_feedback):
+def loss_recursive_exp_multi(node, v_param, system, all_node_action_probs, use_variance_reduction, if_feedback, loss_mode):
     """
     Expected loss at node under the *current stochastic policy* (not conditioned on any expert).
     With multiple parents, the offload term uses the expected parent Q and expected parent exp_loss
     under the conditional distribution over parents given offload.
     """
+    if loss_mode == 'local': # set node.exp_loss to 0
+        node.exp_loss = 0.0
+        return
+
     K = node.K_parents
     # action distribution at this node (length K+1)
     p = all_node_action_probs[node.node_id]
@@ -568,12 +582,14 @@ def loss_recursive_exp_multi(node, v_param, system, all_node_action_probs, use_v
 
 
 def loss_recursive_actual_multi(node, v_param, system, k, a, expert_thresholds,
-                               all_node_action_probs, use_variance_reduction, if_feedback):
+                               all_node_action_probs, use_variance_reduction, if_feedback, loss_mode):
     """
     Loss for expert (k,a): offload to parent k iff theta_a > confidence, else stay.
     """
     o_hat = 1 if expert_thresholds[a] > node.confidence else 0
     parent = node.parents[k]  # specific parent for this expert group
+    if loss_mode == 'local':  # parent.exp_loss should be 0
+        assert parent.exp_loss == 0.0
 
     if use_variance_reduction:
         residual_b = (node.b_true - node.b_hat) / (node.p_to_cloud + 1e-12) * if_feedback
@@ -804,37 +820,89 @@ if __name__ == '__main__':
 
     configs = get_system_configs()
     to_run = ['3layer_4-2-1']
-    # , '3layer_4-2-1', '4layer_1-1-1-1', '4layer_8-4-2-1'
+    # , '5layer_16-8-4-2-1', '3layer_4-2-1', '4layer_1-1-1-1', '4layer_8-4-2-1'
 
     for name in to_run:
         cfg = configs[name]
         print(f"\n{'=' * 60}\nRunning: {name}\n{'=' * 60}")
 
-        all_no_vr, all_vr = [], []
+        all_no_vr = []
+        all_vr = []
+        all_no_exp = []
+        all_no_exp_no_vr = []
+        all_local = []
+        all_unif = []
+        all_rr = []
         for trial in range(NUM_TRIALS):
+            seed = 12 + trial
+            set_all_seeds(seed)
             print(f"Trial {trial + 1}/{NUM_TRIALS}")
-
+            # no variance reduction, with loss expectation
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
             res_no = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM,
-                                      use_variance_reduction=False, initial_error_rates=Avg_err, exploration_gamma=0.1)
+                                      use_variance_reduction=False, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='recursive')
             all_no_vr.append(res_no)
-
+            # with variance reduction, with loss expectation
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
             res_vr = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM,
-                                      use_variance_reduction=True, initial_error_rates=Avg_err, exploration_gamma=0.1)
+                                      use_variance_reduction=True, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='recursive')
             all_vr.append(res_vr)
+            # with variance reduction, no loss expectation
+            system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
+                                             multi_parent=True)
+            res_no_exp = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM,
+                                      use_variance_reduction=True, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='local')
+            all_no_exp.append(res_no_exp)
+            # no variance reduction, no loss expectation
+            system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
+                                             multi_parent=True)
+            res_no_exp_no_vr = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM,
+                                      use_variance_reduction=False, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='local')
+            all_no_exp_no_vr.append(res_no_exp_no_vr)
+
+            # baselines
+            system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
+                                             multi_parent=True)
+            res1 = baseline_all_local(system, NUM_JOBS, data, TASK_NAMES, ERROR_RATES_GT, initial_error_rates=Avg_err)
+            all_local.append(res1)
+
+            system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
+                                             multi_parent=True)
+            res2 = baseline_uniform_random(system, NUM_JOBS, data, TASK_NAMES, ERROR_RATES_GT, p_off=0.3,
+                                           initial_error_rates=Avg_err)
+            all_unif.append(res2)
+
+            system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
+                                             multi_parent=True)
+            res3 = baseline_round_robin(system, NUM_JOBS, data, TASK_NAMES, ERROR_RATES_GT, p_off=0.3,
+                                        initial_error_rates=Avg_err)
+            all_rr.append(res3)
 
         agg_no = aggregate_results(all_no_vr)
         agg_vr = aggregate_results(all_vr)
+        agg_no_exp = aggregate_results(all_no_exp)
+        agg_no_exp_no_vr = aggregate_results(all_no_exp_no_vr)
+        agg_local = aggregate_results(all_local)
+        agg_unif = aggregate_results(all_unif)
+        agg_rr = aggregate_results(all_rr)
 
-        system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
-        plot_results(agg_no, agg_vr, all_no_vr, all_vr, system, NUM_JOBS, prefix=name)
-        plot_layer0_loss(all_no_vr, all_vr, system, prefix=name)
+
+        # plot
+        # system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
+        # plot_results(agg_no, agg_vr, all_no_vr, all_vr, system, NUM_JOBS, prefix=name)
+        # plot_layer0_loss(all_no_vr, all_vr, system, prefix=name)
+
 
         print(f"\n--- {name} Results ---")
         print(
             f"No VR  - Error: {np.mean(agg_no['errors_mean'][-2000:]):.4f}, Feedback: {np.mean(agg_no['feedback_received_mean'][-2000:]):.4f}")
         print(
             f"VR     - Error: {np.mean(agg_vr['errors_mean'][-2000:]):.4f}, Feedback: {np.mean(agg_vr['feedback_received_mean'][-2000:]):.4f}")
-
+        print(
+            f"No Exp - Error: {np.mean(agg_no_exp['errors_mean'][-2000:]):.4f}, Feedback: {np.mean(agg_no_exp['feedback_received_mean'][-2000:]):.4f}")
+        print(
+            f"No Exp No VR - Error: {np.mean(agg_no_exp_no_vr['errors_mean'][-2000:]):.4f}, Feedback: {np.mean(agg_no_exp_no_vr['feedback_received_mean'][-2000:]):.4f}")
+        print(f"Local  - Error: {np.mean(agg_local['errors_mean'][-2000:]):.4f}")
+        print(f"Uniform - Error: {np.mean(agg_unif['errors_mean'][-2000:]):.4f}")
+        print(f"Round Robin - Error: {np.mean(agg_rr['errors_mean'][-2000:]):.4f}")
     print("\n" + "=" * 60 + "\nAll experiments completed!\n" + "=" * 60)
