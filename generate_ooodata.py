@@ -265,7 +265,7 @@ def organize_data():
 # /home/hz8556/llmooo/data/ooo_dataset/full_data/arc_challenge/details_deepseek-ai__deepseek-moe-16b-base.pkl
 # /home/hz8556/llmooo/data/ooo_dataset/full_data/ifeval/deepseek-ai__deepseek-llm-67b-chat-details_1361.pkl
 # 'musr', 'math_lv_5', 'mmlu_pro'
-with open(f'data/ooo_dataset/ooo_dataset1.pkl', 'rb') as f:
+with open(f'data/ooo_dataset/ooo_dataset_pop19.pkl', 'rb') as f:
 # with open(f'data/ooo_dataset/full_data/mmlu_pro/deepseek-ai__deepseek-llm-67b-chat-details_1361.pkl', 'rb') as f:
     ooo_dataset = pickle.load(f)
 # # # # dict_keys(['choices', 'cont_tokens', 'example', 'full_prompt', 'gold',
@@ -276,4 +276,4 @@ with open(f'data/ooo_dataset/ooo_dataset1.pkl', 'rb') as f:
 # print(ooo_dataset['mmlu_pro']['doc'][3].keys())
 print(ooo_dataset['available_models'])
 # print(ooo_dataset['total_samples'])
-# print(ooo_dataset['full_data'][289])
+print(ooo_dataset['full_data'][289])

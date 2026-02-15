@@ -42,6 +42,9 @@ def unique_preserve_order(xs: List[str]) -> List[str]:
 
 
 def merge_two(d1: Dict[str, Any], d2: Dict[str, Any]) -> Dict[str, Any]:
+
+    # remove_model: GPT4o, GeminiFlash2-5
+    ignore_models = ['GPT4o', 'GeminiFlash2-5']
     m1 = d1["available_models"]
     m2 = d2["available_models"]
     merged_models = unique_preserve_order(m1 + m2)
@@ -69,6 +72,8 @@ def merge_two(d1: Dict[str, Any], d2: Dict[str, Any]) -> Dict[str, Any]:
     for k in all_keys:
         r1 = map1.get(k, None)
         r2 = map2.get(k, None)
+        # where this key comes from
+        r_src = "dataset1" if r1 is not None else "dataset2"
 
         # choose a "base" row to carry metadata (category/idx/uid/length)
         base = r1 if r1 is not None else r2
@@ -77,7 +82,7 @@ def merge_two(d1: Dict[str, Any], d2: Dict[str, Any]) -> Dict[str, Any]:
             "category": base.get("category"),
             "idx": base.get("idx"),
             "uid": base.get("uid", None),
-            "length": base.get("length", 0),
+            "length": base.get("length", 0) if r_src == "dataset1" else base.get("length", 0)+4000,
             "results": [0.0] * len(merged_models),
         }
 
@@ -90,7 +95,10 @@ def merge_two(d1: Dict[str, Any], d2: Dict[str, Any]) -> Dict[str, Any]:
         if r2 is not None:
             res2 = r2["results"]
             for model_name, j in idx2.items():
-                v = res2[j]
+                if model_name in ignore_models:
+                    v = 0.0
+                else:
+                    v = res2[j]
                 new_row["results"][midx[model_name]] = 0.0 if v is None else float(v)
 
         merged_full.append(new_row)
@@ -115,9 +123,9 @@ def merge_two(d1: Dict[str, Any], d2: Dict[str, Any]) -> Dict[str, Any]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pkl1", type=str, required=True)
-    ap.add_argument("--pkl2", type=str, required=True)
-    ap.add_argument("--out", type=str, required=True)
+    ap.add_argument("--pkl1", type=str, default='./data/ooo_dataset/ooo_dataset1.pkl')
+    ap.add_argument("--pkl2", type=str, default='./vl_routerbench_data/processed/vl_ooo_dataset.pkl')
+    ap.add_argument("--out", type=str, default='./merged_ooo_dataset.pkl')
     args = ap.parse_args()
 
     d1 = load_pkl(args.pkl1)
@@ -129,6 +137,10 @@ def main():
           "tasks:", len(merged["available_tasks"]),
           "samples:", merged["total_samples"])
 
-
-if __name__ == "__main__":
-    main()
+#
+# if __name__ == "__main__":
+#     main()
+with open('merged_ooo_dataset.pkl', 'rb') as f:
+    merged = pickle.load(f)
+print(merged['available_models'])
+print(merged['full_data'][50000])

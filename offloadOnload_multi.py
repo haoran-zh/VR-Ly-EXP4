@@ -10,7 +10,8 @@ estimate_sample_num = 2000
 
 # read dataset FILENAME = './merged_ooo_dataset.pkl'
 # FILENAME = './data/ooo_dataset/ooo_dataset1.pkl'
-FILENAME = './data/ooo_dataset/ooo_dataset1.pkl'
+FILENAME = './merged_ooo_dataset.pkl'
+# FILENAME = './data/ooo_dataset/ooo_dataset_pop19.pkl'
 with open(FILENAME, 'rb') as f:
     data = pkl.load(f)
 
@@ -26,10 +27,39 @@ avg_offloadCost = estimate_offloadingCost(data, OffloadCost_SCALE)
 NUM_TASK_TYPES = len(data['task_types'])
 TASK_NAMES = data['task_types']
 TOTAL_JOBS = data['total_samples']
-
+# ooo_dataset1.pkl
+# MODEL_SIZES = np.array([0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0])
+# merged_ooo_dataset.pkl
 MODEL_SIZES = np.array([0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0,
-                        0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0,
-                        0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0])
+                        10000, # GPT4o, ignore
+                        10000,
+                        27, 78, 1, 7, 16, 7, 3.5, 12, 8, 32, 72, 2.2, 4.5, 1.0, 7
+                        ])
+
+# ooo_dataset_pop19
+# ['llama2_7b_cpo_details_773', '13_outof_32_pruned_layers_llama3_1_8b_details_3682', 'llama_13b_details_3522', 'autotrain_llama3_70b_orpo_v1_details_1219', 'qwen1_5_1_8b_chat_details_1598', 'calme_2_2_qwen2_7b_details_3186', 'deepseek_r1_distill_qwen_14b_abliterated_v2_details_636', 'deepseek_r1_distill_qwen_32b_details_1975', 'calme_2_1_qwen2_5_72b_details_3442', 'collectivecognition_v1_1_mistral_7b_details_1811', 'merge_mixtral_prometheus_8x7b_details_802', 'dolphin_2_9_3_mistral_nemo_12b_details_786', '3prymmal_phi3_3b_slerp_details_877', 'medphi_4_14b_v1_details_1111', 'athena_gemma_2_2b_it_details_1862', 'athene_codegemma_2_7b_it_alpaca_v1_2_details_524', '4prymmal_gemma2_9b_slerp_details_2671', 'bggpt_gemma_2_27b_it_v1_0_details_1153', 'deepseek_llm_67b_chat_details_1361']
+# MODEL_SIZES = np.array([
+#     7,    # llama2_7b_cpo_details_773
+#     8,    # llama3_1_8b (13_outof_32_pruned_layers_llama3_1_8b_details_3682)
+#     13,   # llama_13b_details_3522
+#     70,   # llama3_70b
+#     1.8,  # qwen1_5_1_8b
+#     7,    # qwen2_7b
+#     14,   # qwen_14b (deepseek_r1_distill_qwen_14b...)
+#     32,   # qwen_32b
+#     72,   # qwen2.5_72b
+#     7,    # mistral_7b
+#     56,   # mixtral_8x7b  -> 8*7 = 56B effective params
+#     12,   # mistral_nemo_12b
+#     3,    # phi3_3b
+#     14,   # phi_14b
+#     2,    # gemma_2b
+#     7,    # gemma_7b
+#     9,    # gemma2_9b
+#     27,   # gemma_27b
+#     67    # deepseek_llm_67b
+# ])
+
 MODEL_ONLOADING_COSTS = MODEL_SIZES
 ONLOADING_EPOCH_LENGTH = 500
 V_ONLOAD = 700
@@ -112,10 +142,10 @@ def get_system_configs():
     configs['4layer_8-4-2-1'] = {
         'num_layers': 4, 'nodes_per_layer': [8, 4, 2, 1],
         'layer_configs': [
-            {'memory': 8, 'models': [0, 5, 6], 'gamma': 0},
-            {'memory': 60, 'models': [0, 2, 5, 6], 'gamma': 0.4},
-            {'memory': 85, 'models': [1, 3, 4, 7], 'gamma': 0.4},
-            {'gamma': 0.4},
+            {'memory': 30, 'models': list(range(25)), 'gamma': 0},
+            {'memory': 80, 'models': list(range(25)), 'gamma': 1.0},
+            {'memory': 200, 'models': list(range(25)), 'gamma': 1.0},
+            {'gamma': 1.0},
         ],
     }
     configs['5layer_16-8-4-2-1'] = {
@@ -124,7 +154,7 @@ def get_system_configs():
             {'memory': 8, 'models': [0, 5, 6], 'gamma': 0},
             {'memory': 30, 'models': [0, 2, 5, 6], 'gamma': 0.4},
             {'memory': 65, 'models': [1, 3, 4, 7], 'gamma': 0.4},
-            {'memory': 85, 'models': [1, 3, 4, 7, 10, 12], 'gamma': 0.4},
+            {'memory': 85, 'models': [1, 3, 4, 7, 2,5,6], 'gamma': 0.4},
             {'gamma': 0.4},
         ],
     }
@@ -228,10 +258,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         node.S = np.zeros((NUM_TASK_TYPES, K_n, num_experts))  # cumulative loss per (k,a)
         node.w = np.ones((NUM_TASK_TYPES, K_n, num_experts)) / (node.num_actions * num_experts + 1e-12)
 
-        if enable_onloading and len(node.available_models) > 0:
-            node.onloaded_models = initialize_onloaded_models(node.memory_capacity, node.available_models)
-        else:
-            node.onloaded_models = list(node.available_models)
+        node.onloaded_models = initialize_onloaded_models(node.memory_capacity, node.available_models)
 
     task_counts = {t: 0 for t in TASK_NAMES}
     node_task_counts = {n.node_id: {t: 0 for t in TASK_NAMES} for n in system.get_non_cloud_nodes()}
@@ -819,7 +846,7 @@ if __name__ == '__main__':
     print(f"Overall Error Rate: {baseline_error:.4f}")
 
     configs = get_system_configs()
-    to_run = ['3layer_4-2-1']
+    to_run = ['4layer_8-4-2-1']
     # , '5layer_16-8-4-2-1', '3layer_4-2-1', '4layer_1-1-1-1', '4layer_8-4-2-1'
 
     for name in to_run:
@@ -833,30 +860,31 @@ if __name__ == '__main__':
         all_local = []
         all_unif = []
         all_rr = []
+        onload = False
         for trial in range(NUM_TRIALS):
-            seed = 12 + trial
+            seed = 11 + trial
             set_all_seeds(seed)
             print(f"Trial {trial + 1}/{NUM_TRIALS}")
             # no variance reduction, with loss expectation
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
-            res_no = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM,
+            res_no = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM, enable_onloading=onload,
                                       use_variance_reduction=False, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='recursive')
             all_no_vr.append(res_no)
             # with variance reduction, with loss expectation
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
-            res_vr = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM,
+            res_vr = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM, enable_onloading=onload,
                                       use_variance_reduction=True, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='recursive')
             all_vr.append(res_vr)
             # with variance reduction, no loss expectation
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
                                              multi_parent=True)
-            res_no_exp = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM,
+            res_no_exp = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM, enable_onloading=onload,
                                       use_variance_reduction=True, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='local')
             all_no_exp.append(res_no_exp)
             # no variance reduction, no loss expectation
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
                                              multi_parent=True)
-            res_no_exp_no_vr = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM,
+            res_no_exp_no_vr = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM, enable_onloading=onload,
                                       use_variance_reduction=False, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='local')
             all_no_exp_no_vr.append(res_no_exp_no_vr)
 
@@ -888,9 +916,10 @@ if __name__ == '__main__':
 
 
         # plot
-        # system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
-        # plot_results(agg_no, agg_vr, all_no_vr, all_vr, system, NUM_JOBS, prefix=name)
-        # plot_layer0_loss(all_no_vr, all_vr, system, prefix=name)
+        system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
+        plot_results(agg_no, agg_vr, all_no_vr, all_vr, system, NUM_JOBS, prefix=name)
+        plot_layer0_loss(all_no_vr, all_vr, system, prefix=name)
+
 
 
         print(f"\n--- {name} Results ---")
