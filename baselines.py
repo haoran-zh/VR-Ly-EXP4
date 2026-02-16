@@ -59,7 +59,7 @@ MODEL_ONLOADING_COSTS = MODEL_SIZES
 # INTERNAL UTILITIES
 # =================================================
 
-def _init_nodes(system, enable_onloading=True):
+def _init_nodes(system, enable_onloading=True, diverse=False):
     """Initialize per-node fields required by baselines."""
     for node in system.get_non_cloud_nodes():
 
@@ -70,13 +70,7 @@ def _init_nodes(system, enable_onloading=True):
         node.K_parents = K
         node.num_actions = K + 1
 
-        if enable_onloading and len(node.available_models) > 0:
-            node.onloaded_models = initialize_onloaded_models(
-                node.memory_capacity,
-                node.available_models,
-            )
-        else:
-            node.onloaded_models = list(node.available_models)
+        initialize_onloaded_models(node, diverse=diverse)
 
         # Round-robin pointer
         if not hasattr(node, "rr_ptr"):
@@ -112,6 +106,7 @@ def _run_baseline(
     initial_error_rates=None,
     p_off=DEFAULT_P_OFF,
     policy="uniform_random",
+    diverse=False,
 ):
     """
     Common simulation loop for non-learning baselines.
@@ -119,7 +114,7 @@ def _run_baseline(
     policy ∈ {"all_local", "uniform_random", "round_robin"}
     """
 
-    _init_nodes(system, enable_onloading)
+    _init_nodes(system, enable_onloading, diverse)
     history = _make_history(system)
 
     NUM_TASK_TYPES = len(TASK_NAMES)
@@ -322,7 +317,7 @@ def _run_baseline(
 # =================================================
 
 def baseline_all_local(system, num_jobs, data, TASK_NAMES, ERROR_RATES_GT,
-                       enable_onloading=True, initial_error_rates=None):
+                       enable_onloading=True, initial_error_rates=None, diverse=False):
     return _run_baseline(
         system,
         num_jobs,
@@ -333,13 +328,14 @@ def baseline_all_local(system, num_jobs, data, TASK_NAMES, ERROR_RATES_GT,
         initial_error_rates,
         p_off=0.0,
         policy="all_local",
+        diverse=diverse
     )
 
 
 def baseline_uniform_random(system, num_jobs, data, TASK_NAMES, ERROR_RATES_GT,
                             p_off=DEFAULT_P_OFF,
                             enable_onloading=True,
-                            initial_error_rates=None):
+                            initial_error_rates=None, diverse=False):
     return _run_baseline(
         system,
         num_jobs,
@@ -350,13 +346,14 @@ def baseline_uniform_random(system, num_jobs, data, TASK_NAMES, ERROR_RATES_GT,
         initial_error_rates,
         p_off=p_off,
         policy="uniform_random",
+        diverse=diverse
     )
 
 
 def baseline_round_robin(system, num_jobs, data, TASK_NAMES, ERROR_RATES_GT,
                          p_off=DEFAULT_P_OFF,
                          enable_onloading=True,
-                         initial_error_rates=None):
+                         initial_error_rates=None, diverse=False):
     return _run_baseline(
         system,
         num_jobs,
@@ -367,4 +364,5 @@ def baseline_round_robin(system, num_jobs, data, TASK_NAMES, ERROR_RATES_GT,
         initial_error_rates,
         p_off=p_off,
         policy="round_robin",
+        diverse=diverse
     )

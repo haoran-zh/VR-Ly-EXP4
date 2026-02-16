@@ -61,7 +61,7 @@ MODEL_SIZES = np.array([0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0,
 # ])
 
 MODEL_ONLOADING_COSTS = MODEL_SIZES
-ONLOADING_EPOCH_LENGTH = 500
+ONLOADING_EPOCH_LENGTH = 1000
 V_ONLOAD = 700
 BEST_MODEL_IDX=7
 
@@ -125,9 +125,9 @@ def get_system_configs():
     configs['3layer_4-2-1'] = {
         'num_layers': 3, 'nodes_per_layer': [4, 2, 1],
         'layer_configs': [
-            {'memory': 17, 'models': [0, 2, 3, 5, 6], 'gamma': 0},
-            {'memory': 85, 'models': [1, 4, 7], 'gamma': 0.4},
-            {'gamma': 0.4},
+            {'memory': 30, 'models': list(range(25)), 'gamma': 0},
+            {'memory': 100, 'models': list(range(25)), 'gamma': 0.5},
+            {'gamma': 0.3},
         ],
     }
     configs['4layer_1-1-1-1'] = {
@@ -143,78 +143,100 @@ def get_system_configs():
         'num_layers': 4, 'nodes_per_layer': [8, 4, 2, 1],
         'layer_configs': [
             {'memory': 30, 'models': list(range(25)), 'gamma': 0},
-            {'memory': 80, 'models': list(range(25)), 'gamma': 1.0},
-            {'memory': 200, 'models': list(range(25)), 'gamma': 1.0},
-            {'gamma': 1.0},
+            {'memory': 80, 'models': list(range(25)), 'gamma': 0.5},
+            {'memory': 200, 'models': list(range(25)), 'gamma': 0.5},
+            {'gamma': 0.3},
         ],
     }
     configs['5layer_16-8-4-2-1'] = {
         'num_layers': 5, 'nodes_per_layer': [16, 8, 4, 2, 1],
         'layer_configs': [
-            {'memory': 8, 'models': [0, 5, 6], 'gamma': 0},
-            {'memory': 30, 'models': [0, 2, 5, 6], 'gamma': 0.4},
-            {'memory': 65, 'models': [1, 3, 4, 7], 'gamma': 0.4},
-            {'memory': 85, 'models': [1, 3, 4, 7, 2,5,6], 'gamma': 0.4},
-            {'gamma': 0.4},
+            {'memory': 30, 'models': list(range(25)), 'gamma': 0},
+            {'memory': 80, 'models': list(range(25)), 'gamma': 0.4},
+            {'memory': 150, 'models': list(range(25)), 'gamma': 0.4},
+            {'memory': 200, 'models': list(range(25)), 'gamma': 0.4},
+            {'gamma': 0.3},
         ],
     }
     return configs
 
 
 
-def initialize_onloaded_models(memory_capacity, model_ids):
-    S = set()
-    remaining = memory_capacity
-    models = list(model_ids)
-    np.random.shuffle(models)
-    for m in models:
-        if MODEL_SIZES[m] <= remaining:
-            S.add(m)
-            remaining -= MODEL_SIZES[m]
-    return list(S)
+def initialize_onloaded_models(node, diverse=False):
+    memory_capacity = node.memory_capacity
+    model_ids = node.available_models
+
+    if not diverse:
+        S = set()
+        remaining = memory_capacity
+        models = list(model_ids)
+        np.random.shuffle(models)
+        for m in models:
+            if MODEL_SIZES[m] <= remaining:
+                S.add(m)
+                remaining -= MODEL_SIZES[m]
+        node.onloaded_models = list(S)
+    else:  # layer-diverse
+        layer_num = 3
+        layer_level = node.level
+        # sort all models based on the model size
+        model_order_small2large = np.argsort(MODEL_SIZES, kind="stable")
+        parts = np.array_split(model_order_small2large, layer_num)
+        models_for_this_layer = parts[layer_level]
+        S = set()
+        remaining = memory_capacity
+        models = models_for_this_layer
+        np.random.shuffle(models)
+        for m in models:
+            if MODEL_SIZES[m] <= remaining:
+                S.add(m)
+                remaining -= MODEL_SIZES[m]
+        node.onloaded_models = list(S)
+
 
 
 def enhanced_greedy_onloading(V, prev_models, memory, model_sizes, onload_costs,
                               error_dict, task_dist, available_models, task_names):
-    S = set()
+    S = []
     remaining = memory
-    prev_set = set(prev_models)
+    # print('previous set', prev_models)
     while True:
-        best_model, best_ratio = -1, -np.inf
-        candidates = [(i, m) for i, m in enumerate(available_models)
-                      if m not in S and model_sizes[i] <= remaining]
+        best_model_idx, best_net = None, -1.0
+        candidates = [i for i in available_models
+                      if i not in S and model_sizes[i] <= remaining]
         if not candidates:
             break
         exp_err = []
         for t in task_names:
-            if not S:
+            if len(S)==0:  # if S is empty
                 exp_err.append(1.0)
             else:
-                errs = [error_dict[t][m] for m in S if m in error_dict[t]]
-                exp_err.append(min(errs) if errs else 1.0)
-        for i, m in candidates:
+                errs = [error_dict[t][i] for i in S]
+                exp_err.append(min(errs) if len(errs)!=0 else 1.0)
+        for i in candidates:
             gain = 0.0
-            S_plus = S.union({m})
+            S_plus = S + [i]
             for ti, t in enumerate(task_names):
-                errs_plus = [error_dict[t][x] for x in S_plus if x in error_dict[t]]
-                err_plus = min(errs_plus) if errs_plus else 1.0
-                gain += V * task_dist[ti] * (exp_err[ti] - err_plus)
-            cost = onload_costs[i] if m not in prev_set else 0
-            net = gain - cost
-            if net > 0 and net / model_sizes[i] > best_ratio:
-                best_ratio = net / model_sizes[i]
-                best_model, best_idx = m, i
-        if best_model == -1:
+                errs_plus = [error_dict[t][x] for x in S_plus]
+                err_plus = min(errs_plus) if len(errs_plus)!=0 else 1.0
+                gain += task_dist[ti] * (exp_err[ti] - err_plus)
+            cost = onload_costs[i] if i not in prev_models else 0
+            net = gain - cost * 0.01
+            if net >= 0 and net >= best_net:
+                best_net = net
+                best_model_idx = i
+        if best_model_idx is None:
             break
-        S.add(best_model)
-        remaining -= model_sizes[best_idx]
-    total = sum(onload_costs[i] for i, m in enumerate(available_models) if m in S and m not in prev_set)
-    return list(S), total
+        S.append(best_model_idx)
+        remaining -= model_sizes[best_model_idx]
+    total = sum(onload_costs[i] for i, m in enumerate(available_models) if m in S and m not in prev_models)
+    # print('onloaded models', S)
+    return S, total
 
 
 def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                      use_variance_reduction=False, enable_onloading=True, initial_error_rates=None,
-                     exploration_gamma=0.05, loss_mode='recursive'):
+                     exploration_gamma=0.05, loss_mode='recursive', diverse=False):
     """
     Multi-layer EXP4 (bandits with expert advice) for *multi-parent* offloading.
 
@@ -240,6 +262,8 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
     The loss recursion also generalizes by using the *expected* parent-Q and expected parent-exp-loss
     under the conditional distribution over parents given offload.
     """
+    oracle_avg_error = 0.0
+
     expert_thresholds = np.linspace(0, 1, num_experts)
 
     ERROR_LEARNING_RATE = 1/estimate_sample_num
@@ -258,7 +282,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         node.S = np.zeros((NUM_TASK_TYPES, K_n, num_experts))  # cumulative loss per (k,a)
         node.w = np.ones((NUM_TASK_TYPES, K_n, num_experts)) / (node.num_actions * num_experts + 1e-12)
 
-        node.onloaded_models = initialize_onloaded_models(node.memory_capacity, node.available_models)
+        initialize_onloaded_models(node, diverse=diverse)
 
     task_counts = {t: 0 for t in TASK_NAMES}
     node_task_counts = {n.node_id: {t: 0 for t in TASK_NAMES} for n in system.get_non_cloud_nodes()}
@@ -281,6 +305,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         'node_offload_decisions': {n.node_id: [] for n in system.get_non_cloud_nodes()},
         'feedback_received': [], 'onload_costs': [], 'execution_layer': [],
         'node_loss_values': {n.node_id: [] for n in system.get_non_cloud_nodes()},
+        "oracle_avg_error": 0,
     }
 
     # Helper: compute action distribution at node given confidence z
@@ -344,7 +369,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                 new_models, cost = enhanced_greedy_onloading(
                     V_ONLOAD, node.onloaded_models, node.memory_capacity,
                     MODEL_SIZES[node.available_models], MODEL_ONLOADING_COSTS[node.available_models],
-                    estimated_error_rates_per_node[node.node_id], local_dist, node.available_models, TASK_NAMES
+                    ERROR_RATES_GT, local_dist, node.available_models, TASK_NAMES
                 )
                 node.onloaded_models = new_models
                 total_onload_cost += cost
@@ -362,6 +387,8 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         task_type = data['full_data'][idx]['category']
         task_type_idx = TASK_NAMES.index(task_type)
         task_counts[task_type] += 1
+
+        oracle_avg_error += np.min(1-np.array(data['full_data'][idx]['results']))
 
         start_node = random.choice(system.get_leaf_nodes())
 
@@ -565,6 +592,7 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         history['costs_total'].append(total_job_cost)
         history['feedback_received'].append(1 if feedback_received else 0)
         history['execution_layer'].append(executed_at_node.level)
+    history['oracle_avg_error'] = oracle_avg_error/num_jobs
 
     return history
 
@@ -846,7 +874,7 @@ if __name__ == '__main__':
     print(f"Overall Error Rate: {baseline_error:.4f}")
 
     configs = get_system_configs()
-    to_run = ['4layer_8-4-2-1']
+    to_run = ['3layer_4-2-1']
     # , '5layer_16-8-4-2-1', '3layer_4-2-1', '4layer_1-1-1-1', '4layer_8-4-2-1'
 
     for name in to_run:
@@ -861,49 +889,57 @@ if __name__ == '__main__':
         all_unif = []
         all_rr = []
         onload = False
+        diverse = False
         for trial in range(NUM_TRIALS):
-            seed = 11 + trial
-            set_all_seeds(seed)
             print(f"Trial {trial + 1}/{NUM_TRIALS}")
             # no variance reduction, with loss expectation
+            seed = 11 + trial
+            set_all_seeds(seed)
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
             res_no = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM, enable_onloading=onload,
-                                      use_variance_reduction=False, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='recursive')
+                                      use_variance_reduction=False, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='recursive', diverse=diverse)
             all_no_vr.append(res_no)
+            print('oracle_avg_error', res_no['oracle_avg_error'])
             # with variance reduction, with loss expectation
+            seed = 11 + trial
+            set_all_seeds(seed)
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
             res_vr = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM, enable_onloading=onload,
-                                      use_variance_reduction=True, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='recursive')
+                                      use_variance_reduction=True, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='recursive', diverse=diverse)
             all_vr.append(res_vr)
             # with variance reduction, no loss expectation
+            seed = 11 + trial
+            set_all_seeds(seed)
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
                                              multi_parent=True)
             res_no_exp = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM, enable_onloading=onload,
-                                      use_variance_reduction=True, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='local')
+                                      use_variance_reduction=True, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='local', diverse=diverse)
             all_no_exp.append(res_no_exp)
             # no variance reduction, no loss expectation
+            seed = 11 + trial
+            set_all_seeds(seed)
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
                                              multi_parent=True)
             res_no_exp_no_vr = multi_layer_exp4(system, NUM_JOBS, NUM_EXPERTS, LEARNING_RATE, V_PARAM, enable_onloading=onload,
-                                      use_variance_reduction=False, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='local')
+                                      use_variance_reduction=False, initial_error_rates=Avg_err, exploration_gamma=0.1, loss_mode='local', diverse=diverse)
             all_no_exp_no_vr.append(res_no_exp_no_vr)
 
             # baselines
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
                                              multi_parent=True)
-            res1 = baseline_all_local(system, NUM_JOBS, data, TASK_NAMES, ERROR_RATES_GT, initial_error_rates=Avg_err)
+            res1 = baseline_all_local(system, NUM_JOBS, data, TASK_NAMES, ERROR_RATES_GT, initial_error_rates=Avg_err, diverse=diverse)
             all_local.append(res1)
 
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
                                              multi_parent=True)
             res2 = baseline_uniform_random(system, NUM_JOBS, data, TASK_NAMES, ERROR_RATES_GT, p_off=0.3,
-                                           initial_error_rates=Avg_err)
+                                           initial_error_rates=Avg_err, diverse=diverse)
             all_unif.append(res2)
 
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
                                              multi_parent=True)
             res3 = baseline_round_robin(system, NUM_JOBS, data, TASK_NAMES, ERROR_RATES_GT, p_off=0.3,
-                                        initial_error_rates=Avg_err)
+                                        initial_error_rates=Avg_err, diverse=diverse)
             all_rr.append(res3)
 
         agg_no = aggregate_results(all_no_vr)
