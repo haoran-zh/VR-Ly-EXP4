@@ -77,6 +77,37 @@ def set_all_seeds(seed: int):
     np.random.seed(seed)
 
 
+def compute_hit_rate(history):
+    """
+    Compute Hit Rate (Recall on hard jobs).
+
+    HitRate = (# hard jobs sent to final layer) / (# hard jobs)
+
+    Parameters
+    ----------
+    history : dict
+        history['hard_jobs']      -> list of indices of truly hard jobs
+        history['feedback_jobs']  -> list of indices of jobs routed to final layer
+
+    Returns
+    -------
+    hit_rate : float
+    TP : int   (# correctly offloaded hard jobs)
+    FN : int   (# missed hard jobs)
+    """
+
+    hard_jobs = set(history.get('hard_jobs', []))
+    final_jobs = set(history.get('feedback_jobs', []))
+
+    if len(hard_jobs) == 0:
+        return 0.0, 0, 0
+
+    TP = len(hard_jobs & final_jobs)   # correctly offloaded hard jobs
+
+    hit_rate = TP / len(hard_jobs)
+
+    return hit_rate
+
 # error rate if all jobs were executed by a specific model
 def compute_baseline_error_rate(model_idx=BEST_MODEL_IDX):
     """
@@ -306,6 +337,9 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         'feedback_received': [], 'onload_costs': [], 'execution_layer': [],
         'node_loss_values': {n.node_id: [] for n in system.get_non_cloud_nodes()},
         "oracle_avg_error": 0,
+        "hard_jobs": [],
+        "feedback_jobs": [],
+        "hard_hit_rate": 0,
     }
 
     # Helper: compute action distribution at node given confidence z
@@ -589,10 +623,19 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
                 history['node_queues'][node.node_id].append(node.Q)
 
         history['errors'].append(job_error)
-        history['costs_total'].append(total_job_cost)
+        history['costs_total'].append(total_job_cost)  # costs_total is the offload cost
         history['feedback_received'].append(1 if feedback_received else 0)
         history['execution_layer'].append(executed_at_node.level)
+
+        if np.min(1-np.array(data['full_data'][idx]['results'])) == 1:
+            # this is a very hard job, none of the models can inference it correctly
+            history['hard_jobs'].append(idx)
+        if feedback_received:
+            history['feedback_jobs'].append(idx)
+
+
     history['oracle_avg_error'] = oracle_avg_error/num_jobs
+    history['hard_hit_rate'] = compute_hit_rate(history)
 
     return history
 
