@@ -2,6 +2,10 @@ import matplotlib.pyplot as plt
 from utilities.system import HierarchicalSystemMulti
 import os
 from baselines import *
+import numpy as np
+import pickle as pkl
+import random
+import copy
 
 estimate_sample_num = 2000
 
@@ -330,16 +334,23 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         cost_obs_count = {t: estimate_sample_num for t in TASK_NAMES}
 
     history = {
-        'errors': [], 'costs_total': [],
+        'errors': [],
+        'costs_total': [],
         'node_costs': {n.node_id: [] for n in system.get_non_cloud_nodes()},
         'node_queues': {n.node_id: [] for n in system.nodes.values() if n.Q is not None},
         'node_offload_decisions': {n.node_id: [] for n in system.get_non_cloud_nodes()},
-        'feedback_received': [], 'onload_costs': [], 'execution_layer': [],
+        'feedback_received': [],
+        'onload_costs': [],
+        'execution_layer': [],
         'node_loss_values': {n.node_id: [] for n in system.get_non_cloud_nodes()},
         "oracle_avg_error": 0,
         "hard_jobs": [],
         "feedback_jobs": [],
         "hard_hit_rate": 0,
+        # record average queue length across all nodes per job
+        "avg_queue": [],
+        # record average entropy of expert weights across all nodes per job
+        "avg_entropy": [],
     }
 
     # Helper: compute action distribution at node given confidence z
@@ -627,11 +638,33 @@ def multi_layer_exp4(system, num_jobs, num_experts, learning_rate, v_param,
         history['feedback_received'].append(1 if feedback_received else 0)
         history['execution_layer'].append(executed_at_node.level)
 
-        if np.min(1-np.array(data['full_data'][idx]['results'])) == 1:
+        if np.min(1 - np.array(data['full_data'][idx]['results'])) == 1:
             # this is a very hard job, none of the models can inference it correctly
             history['hard_jobs'].append(idx)
         if feedback_received:
             history['feedback_jobs'].append(idx)
+
+        # Compute and record average queue length across all non-cloud nodes
+        avg_q_val = np.mean([node.Q for node in system.nodes.values() if node.Q is not None])
+        history['avg_queue'].append(float(avg_q_val))
+        # Compute and record average entropy of expert weights across nodes for the current task type
+        entropy_vals = []
+        for node in system.get_non_cloud_nodes():
+            K_node = getattr(node, 'K_parents', 0)
+            if K_node is None or K_node == 0:
+                continue
+            # Use the weight distribution for the current task type
+            w_flat = node.w[task_type_idx].reshape(-1)
+            w_sum = np.sum(w_flat)
+            if w_sum <= 0:
+                continue
+            w_norm = w_flat / w_sum
+            ent = -float(np.sum(w_norm * np.log(w_norm + 1e-12)))
+            entropy_vals.append(ent)
+        if len(entropy_vals) > 0:
+            history['avg_entropy'].append(float(np.mean(entropy_vals)))
+        else:
+            history['avg_entropy'].append(0.0)
 
 
     history['oracle_avg_error'] = oracle_avg_error/num_jobs
@@ -727,6 +760,95 @@ def aggregate_results(all_histories):
             except:
                 aggregated[key] = all_histories[0][key]
     return aggregated
+
+def plot_comparison_metrics(aggregated_results_dict, algorithms, system, num_jobs, prefix='comparison'):
+    """
+    Plot comparative metrics across multiple algorithms.
+
+    Parameters
+    ----------
+    aggregated_results_dict : dict
+        Dictionary mapping algorithm names to aggregated result dictionaries.
+    algorithms : list
+        List of algorithm names in the order to plot.
+    system : HierarchicalSystemMulti
+        The system configuration used (for title context).
+    num_jobs : int
+        Number of jobs in each simulation.
+    prefix : str
+        Prefix for saved figure filename.
+    """
+    jobs = np.arange(num_jobs)
+    fig, axes = plt.subplots(3, 1, figsize=(14, 18), sharex=True)
+    fig.suptitle(f'Performance Comparison ({system.num_layers} Layers, {system.nodes_per_layer})', fontsize=20)
+
+    # Error curves (cumulative average error rate)
+    for algo in algorithms:
+        agg = aggregated_results_dict.get(algo)
+        if agg is None or 'errors_mean' not in agg:
+            continue
+        cum_err = np.cumsum(agg['errors_mean']) / (jobs + 1)
+        axes[0].plot(jobs, cum_err, label=algo)
+    axes[0].set_ylabel('Avg Error Rate', fontsize=16)
+    axes[0].legend()
+    axes[0].grid(True)
+
+    # Entropy curves
+    for algo in algorithms:
+        agg = aggregated_results_dict.get(algo)
+        if agg is None:
+            continue
+        if 'avg_entropy_mean' in agg:
+            axes[1].plot(jobs, agg['avg_entropy_mean'], label=algo)
+    axes[1].set_ylabel('Avg Entropy', fontsize=16)
+    axes[1].legend()
+    axes[1].grid(True)
+
+    # Average queue curves
+    for algo in algorithms:
+        agg = aggregated_results_dict.get(algo)
+        if agg is None:
+            continue
+        if 'avg_queue_mean' in agg:
+            axes[2].plot(jobs, agg['avg_queue_mean'], label=algo)
+    axes[2].set_ylabel('Avg Queue Size', fontsize=16)
+    axes[2].set_xlabel('Jobs', fontsize=16)
+    axes[2].legend()
+    axes[2].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(f'{prefix}_comparison_metrics.png', dpi=300, bbox_inches='tight')
+    print(f"Saved {prefix}_comparison_metrics.png")
+    plt.close()
+
+def summarize_results(all_results_dict):
+    """
+    Print summary statistics (mean and standard deviation across random seeds) for each algorithm.
+
+    Parameters
+    ----------
+    all_results_dict : dict
+        Mapping from algorithm name to list of history dictionaries (one per seed).
+    """
+    print("\nSummary of Results (mean ± std across seeds):")
+    for algo, histories in all_results_dict.items():
+        if len(histories) == 0:
+            continue
+        # Compute average metrics per seed
+        error_rates = [float(np.mean(h['errors'])) for h in histories]
+        feedback_rates = [float(np.mean(h['feedback_received'])) for h in histories]
+        offload_costs = [float(np.mean(h['costs_total'])) for h in histories]
+        onload_costs = [float(np.mean(h['onload_costs'])) for h in histories]
+        hard_hit_rates = [h.get('hard_hit_rate', 0.0) for h in histories]
+
+        print(f"Algorithm: {algo}")
+        print(f"  Error Rate: {np.mean(error_rates):.4f} ± {np.std(error_rates):.4f}")
+        print(f"  Feedback Rate: {np.mean(feedback_rates):.4f} ± {np.std(feedback_rates):.4f}")
+        print(f"  Offloading Cost: {np.mean(offload_costs):.4f} ± {np.std(offload_costs):.4f}")
+        print(f"  Onloading Cost: {np.mean(onload_costs):.4f} ± {np.std(onload_costs):.4f}")
+        if len(hard_hit_rates) > 0:
+            print(f"  Hard Hit Rate: {np.mean(hard_hit_rates):.4f} ± {np.std(hard_hit_rates):.4f}")
+        print()
 
 
 def plot_results(agg_no_vr, agg_vr, all_no_vr, all_vr, system, num_jobs, prefix='results'):
@@ -931,7 +1053,7 @@ if __name__ == '__main__':
         all_local = []
         all_unif = []
         all_rr = []
-        onload = False
+        onload = True
         diverse = False
         for trial in range(NUM_TRIALS):
             print(f"Trial {trial + 1}/{NUM_TRIALS}")
@@ -993,11 +1115,40 @@ if __name__ == '__main__':
         agg_unif = aggregate_results(all_unif)
         agg_rr = aggregate_results(all_rr)
 
-
-        # plot
+        # Construct a fresh system for plotting context
         system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'], multi_parent=True)
+
+        # Prepare dictionary of aggregated results keyed by algorithm names
+        aggregated_dicts = {
+            'No VR': agg_no,
+            'VR': agg_vr,
+            'No EXP': agg_no_exp,
+            'No EXP No VR': agg_no_exp_no_vr,
+            'All Local': agg_local,
+            'Uniform Random': agg_unif,
+            'Round Robin': agg_rr,
+        }
+        # List of algorithm names in desired plotting order
+        algo_order = ['No VR', 'VR', 'No EXP', 'No EXP No VR', 'All Local', 'Uniform Random', 'Round Robin']
+
+        # Plot comparison metrics across all algorithms
+        plot_comparison_metrics(aggregated_dicts, algo_order, system, NUM_JOBS, prefix=name)
+
+        # Also retain the original performance plots for variance-reduced algorithms
         plot_results(agg_no, agg_vr, all_no_vr, all_vr, system, NUM_JOBS, prefix=name)
         plot_layer0_loss(all_no_vr, all_vr, system, prefix=name)
+
+        # Print summary statistics for all algorithms
+        all_results_dict = {
+            'No VR': all_no_vr,
+            'VR': all_vr,
+            'No EXP': all_no_exp,
+            'No EXP No VR': all_no_exp_no_vr,
+            'All Local': all_local,
+            'Uniform Random': all_unif,
+            'Round Robin': all_rr,
+        }
+        summarize_results(all_results_dict)
 
 
 

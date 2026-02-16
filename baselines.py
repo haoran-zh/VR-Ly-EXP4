@@ -89,6 +89,10 @@ def _make_history(system):
         "onload_costs": [],
         "execution_layer": [],
         "node_loss_values": {n.node_id: [] for n in system.get_non_cloud_nodes()},
+        # record average queue length across nodes per job
+        "avg_queue": [],
+        # record average entropy of expert weights per job (baseline has no expert weights; set to zero)
+        "avg_entropy": [],
     }
 
 
@@ -307,7 +311,14 @@ def _run_baseline(
         history["errors"].append(job_error)
         history["costs_total"].append(total_cost)
         history["feedback_received"].append(feedback)
+
         history["execution_layer"].append(executed_node.level)
+
+        # Record average queue length across nodes and placeholder entropy
+        avg_q = np.mean([node.Q for node in system.nodes.values() if node.Q is not None])
+        history["avg_queue"].append(float(avg_q))
+        # Baselines do not maintain expert weights; record zero entropy
+        history["avg_entropy"].append(0.0)
 
     return history
 
