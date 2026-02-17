@@ -161,8 +161,8 @@ def get_system_configs():
         'num_layers': 3, 'nodes_per_layer': [4, 2, 1],
         'layer_configs': [
             {'memory': 30, 'models': list(range(25)), 'gamma': 0},
-            {'memory': 100, 'models': list(range(25)), 'gamma': 0.5},
-            {'gamma': 0.3},
+            {'memory': 100, 'models': list(range(25)), 'gamma': 0.4},
+            {'gamma': 0.4},
         ],
     }
     configs['4layer_1-1-1-1'] = {
@@ -178,9 +178,9 @@ def get_system_configs():
         'num_layers': 4, 'nodes_per_layer': [8, 4, 2, 1],
         'layer_configs': [
             {'memory': 30, 'models': list(range(25)), 'gamma': 0},
-            {'memory': 80, 'models': list(range(25)), 'gamma': 0.5},
-            {'memory': 200, 'models': list(range(25)), 'gamma': 0.5},
-            {'gamma': 0.3},
+            {'memory': 80, 'models': list(range(25)), 'gamma': 0.4},
+            {'memory': 200, 'models': list(range(25)), 'gamma': 0.4},
+            {'gamma': 0.4},
         ],
     }
     configs['5layer_16-8-4-2-1'] = {
@@ -190,7 +190,7 @@ def get_system_configs():
             {'memory': 80, 'models': list(range(25)), 'gamma': 0.4},
             {'memory': 150, 'models': list(range(25)), 'gamma': 0.4},
             {'memory': 200, 'models': list(range(25)), 'gamma': 0.4},
-            {'gamma': 0.3},
+            {'gamma': 0.4},
         ],
     }
     return configs
@@ -761,9 +761,14 @@ def aggregate_results(all_histories):
                 aggregated[key] = all_histories[0][key]
     return aggregated
 
-def plot_comparison_metrics(aggregated_results_dict, algorithms, system, num_jobs, prefix='comparison'):
+def plot_comparison_metrics(aggregated_results_dict, algorithms, system, num_jobs, prefix='comparison', smooth_window=500):
     """
     Plot comparative metrics across multiple algorithms.
+
+    This function generates a three-panel figure with the following metrics:
+      1. Cumulative average error rate across jobs for each algorithm.
+      2. Smoothed average entropy of expert weights (moving average) for each algorithm.
+      3. Average queue length across nodes for each algorithm.
 
     Parameters
     ----------
@@ -777,6 +782,9 @@ def plot_comparison_metrics(aggregated_results_dict, algorithms, system, num_job
         Number of jobs in each simulation.
     prefix : str
         Prefix for saved figure filename.
+    smooth_window : int, optional
+        Window size (in number of jobs) for the moving-average smoothing of entropy curves.
+        If set to 0 or 1, no smoothing is applied. Larger values produce smoother curves.
     """
     jobs = np.arange(num_jobs)
     fig, axes = plt.subplots(3, 1, figsize=(14, 18), sharex=True)
@@ -793,13 +801,21 @@ def plot_comparison_metrics(aggregated_results_dict, algorithms, system, num_job
     axes[0].legend()
     axes[0].grid(True)
 
-    # Entropy curves
+    # Smoothed entropy curves
     for algo in algorithms:
         agg = aggregated_results_dict.get(algo)
         if agg is None:
             continue
         if 'avg_entropy_mean' in agg:
-            axes[1].plot(jobs, agg['avg_entropy_mean'], label=algo)
+            ent = np.array(agg['avg_entropy_mean'])
+            if smooth_window is not None and smooth_window > 1:
+                window = min(smooth_window, len(ent))
+                weights = np.ones(window) / window
+                # Use 'same' mode to keep the same length as ent
+                smoothed = np.convolve(ent, weights, mode='same')
+                axes[1].plot(jobs, smoothed, label=algo)
+            else:
+                axes[1].plot(jobs, ent, label=algo)
     axes[1].set_ylabel('Avg Entropy', fontsize=16)
     axes[1].legend()
     axes[1].grid(True)
@@ -1039,7 +1055,7 @@ if __name__ == '__main__':
     print(f"Overall Error Rate: {baseline_error:.4f}")
 
     configs = get_system_configs()
-    to_run = ['3layer_4-2-1']
+    to_run = ['4layer_8-4-2-1']
     # , '5layer_16-8-4-2-1', '3layer_4-2-1', '4layer_1-1-1-1', '4layer_8-4-2-1'
 
     for name in to_run:
@@ -1097,13 +1113,13 @@ if __name__ == '__main__':
 
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
                                              multi_parent=True)
-            res2 = baseline_uniform_random(system, NUM_JOBS, data, TASK_NAMES, ERROR_RATES_GT, p_off=0.3,
+            res2 = baseline_uniform_random(system, NUM_JOBS, data, TASK_NAMES, ERROR_RATES_GT, p_off=0.12,
                                            initial_error_rates=Avg_err, diverse=diverse)
             all_unif.append(res2)
 
             system = HierarchicalSystemMulti(cfg['num_layers'], cfg['nodes_per_layer'], cfg['layer_configs'],
                                              multi_parent=True)
-            res3 = baseline_round_robin(system, NUM_JOBS, data, TASK_NAMES, ERROR_RATES_GT, p_off=0.3,
+            res3 = baseline_round_robin(system, NUM_JOBS, data, TASK_NAMES, ERROR_RATES_GT, p_off=0.12,
                                         initial_error_rates=Avg_err, diverse=diverse)
             all_rr.append(res3)
 
