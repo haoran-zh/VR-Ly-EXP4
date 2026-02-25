@@ -12,9 +12,9 @@ estimate_sample_num = 2000
 # remaining jobs: datasets (today), baselines (without loss design, Tuesday)
 # TODO: define onloading cost when using merged_dataset
 
-# read dataset FILENAME = './merged_ooo_dataset.pkl'
+# read dataset FILENAME = './merged_dataset.pkl'
 # FILENAME = './data/ooo_dataset/ooo_dataset1.pkl'
-FILENAME = './merged_ooo_dataset.pkl'
+FILENAME = 'merged_dataset.pkl'
 # FILENAME = './data/ooo_dataset/ooo_dataset_pop19.pkl'
 with open(FILENAME, 'rb') as f:
     data = pkl.load(f)
@@ -33,7 +33,7 @@ TASK_NAMES = data['task_types']
 TOTAL_JOBS = data['total_samples']
 # ooo_dataset1.pkl
 # MODEL_SIZES = np.array([0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0])
-# merged_ooo_dataset.pkl
+# merged_dataset.pkl
 MODEL_SIZES = np.array([0.7, 1.5, 7.0, 16.0, 67.0, 0.5, 0.5, 72.0,
                         10000, # GPT4o, ignore
                         10000,
@@ -1055,8 +1055,8 @@ if __name__ == '__main__':
     print(f"Overall Error Rate: {baseline_error:.4f}")
 
     configs = get_system_configs()
-    to_run = ['4layer_8-4-2-1']
-    # , '5layer_16-8-4-2-1', '3layer_4-2-1', '4layer_1-1-1-1', '4layer_8-4-2-1'
+    to_run = ['5layer_16-8-4-2-1']
+    # , '5layer_16-8-4-2-1', '3layer_4-2-1', '4layer_8-4-2-1'
 
     for name in to_run:
         cfg = configs[name]

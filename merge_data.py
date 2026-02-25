@@ -125,7 +125,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pkl1", type=str, default='./data/ooo_dataset/ooo_dataset1.pkl')
     ap.add_argument("--pkl2", type=str, default='./vl_routerbench_data/processed/vl_ooo_dataset.pkl')
-    ap.add_argument("--out", type=str, default='./merged_ooo_dataset.pkl')
+    ap.add_argument("--out", type=str, default='./merged_dataset.pkl')
     args = ap.parse_args()
 
     d1 = load_pkl(args.pkl1)
@@ -140,7 +140,7 @@ def main():
 #
 # if __name__ == "__main__":
 #     main()
-with open('merged_ooo_dataset.pkl', 'rb') as f:
+with open('merged_dataset.pkl', 'rb') as f:
     merged = pickle.load(f)
 print(merged['available_models'])
 print(merged['full_data'][50000])
